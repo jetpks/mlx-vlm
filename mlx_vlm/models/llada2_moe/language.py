@@ -10,14 +10,16 @@ from ..activations import swiglu
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, StaticPrefixKVCache
 from ..diffusion_visualizer import DiffusionUnmaskingVisualizer
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import ModelConfig
 
 
 def _topk(x: mx.array, k: int, axis: int = -1) -> Tuple[mx.array, mx.array]:
     indices = mx.argpartition(-x, kth=k - 1, axis=axis)[..., :k]
+    indices = mx.stop_gradient(indices)
     values = mx.take_along_axis(x, indices, axis=axis)
     order = mx.argsort(-values, axis=axis)
+    order = mx.stop_gradient(order)
     return mx.take_along_axis(values, order, axis=axis), mx.take_along_axis(
         indices, order, axis=axis
     )
@@ -309,15 +311,21 @@ class LanguageModel(nn.Module):
         if p is None or p >= 1.0:
             return logits
         sorted_indices = mx.argsort(-logits, axis=-1)
+        sorted_indices = mx.stop_gradient(sorted_indices)
         sorted_logits = mx.take_along_axis(logits, sorted_indices, axis=-1)
+        # Sum in float32: a float16/bfloat16 running sum stops growing once the
+        # remaining probabilities are below its precision, so it may never
+        # reach p and every token would be kept.
         cumulative_probs = mx.cumsum(
-            mx.softmax(sorted_logits, axis=-1, precise=True), axis=-1
+            mx.softmax(sorted_logits.astype(mx.float32), axis=-1, precise=True),
+            axis=-1,
         )
         sorted_mask = cumulative_probs > p
         sorted_mask = mx.concatenate(
             [mx.zeros_like(sorted_mask[..., :1]), sorted_mask[..., :-1]], axis=-1
         )
         inverse_indices = mx.argsort(sorted_indices, axis=-1)
+        inverse_indices = mx.stop_gradient(inverse_indices)
         mask = mx.take_along_axis(sorted_mask, inverse_indices, axis=-1)
         return mx.where(mask, mx.finfo(logits.dtype).min, logits)
 
@@ -327,6 +335,7 @@ class LanguageModel(nn.Module):
         temperature: float = 0.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        rng=None,
     ):
         if temperature == 0.0:
             token = mx.argmax(logits, axis=-1)
@@ -338,12 +347,20 @@ class LanguageModel(nn.Module):
             logits = logits / temperature
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
-        token = mx.random.categorical(logits.astype(mx.float32), axis=-1)
+        token = mx.random.categorical(
+            logits.astype(mx.float32), axis=-1, key=rng() if rng is not None else None
+        )
         probs = mx.softmax(logits.astype(mx.float32), axis=-1, precise=True)
         token_prob = mx.take_along_axis(probs, token[..., None], axis=-1)[..., 0]
         return token, token_prob
 
-    def generate(
+    def generate(self, *args, **kwargs):
+        """Generate synchronously, retaining the callback API."""
+        from ...generate.common import consume_generator
+
+        return consume_generator(self.generate_blocks(*args, **kwargs))
+
+    def generate_blocks(
         self,
         inputs: mx.array,
         temperature: float = 0.0,
@@ -371,7 +388,13 @@ class LanguageModel(nn.Module):
         on_block: Optional[Callable[[List[int]], bool]] = None,
         on_result: Optional[Callable[[GenerationResult], bool]] = None,
         **kwargs,
-    ) -> mx.array:
+    ):
+        """Yield after each committed block; return the final token array.
+
+        Results are delivered through on_result. Closing this iterator releases
+        the unfinished generation without starting another denoising block.
+        """
+        rng = kwargs.pop("_rng", None)
         generation_mode = kwargs.pop("generation_mode", None)
         if generation_mode in ("linear_speculative", "linear_spec") or kwargs.pop(
             "linear_speculative", False
@@ -570,6 +593,7 @@ class LanguageModel(nn.Module):
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
+                    rng=rng,
                 )
                 if stats is not None and not recorded_prompt_time:
                     mx.eval(x0, x0_p)
@@ -659,6 +683,8 @@ class LanguageModel(nn.Module):
                 if not keep_going:
                     callback_stopped = True
                     break
+            # Retain the canvas, caches and loop position until the next block.
+            yield
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):
@@ -702,7 +728,7 @@ class LanguageModel(nn.Module):
                 continue
             prefix = f"language_model.model.layers.{layer_idx}.mlp"
             for module in ("gate_proj", "down_proj", "up_proj"):
-                for suffix in ("weight", "scales", "biases"):
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
                     first_key = f"{prefix}.experts.0.{module}.{suffix}"
                     if first_key not in weights:
                         continue

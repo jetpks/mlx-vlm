@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..interpolate import bilinear_interpolate
+from ..rope_utils import rotate_half
 from .config import VisionConfig
 
 
@@ -18,13 +19,6 @@ def check_array_shape(arr):
         return True
     else:
         return False
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_rotary_pos_emb_vision(tensor, freqs) -> mx.array:
@@ -443,6 +437,11 @@ class VisionModel(nn.Module):
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+        # Patches packed as (total_patches, C, H, W), e.g. a training batch of
+        # differently sized images, are one sequence split by grid_thw.
+        if hidden_states.ndim == 4:
+            hidden_states = mx.expand_dims(hidden_states, axis=0)
+
         if self._use_same_grid_batch_path(
             hidden_states, grid_thw, output_hidden_states
         ):

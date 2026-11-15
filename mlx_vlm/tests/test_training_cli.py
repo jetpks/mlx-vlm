@@ -1,0 +1,374 @@
+"""The CLI and notebook API share preparation, configuration, and training."""
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+import numpy as np
+import pytest
+
+from mlx_vlm.train import _load_dataset, build_parser, parse_args, run
+from mlx_vlm.trainer import DPOTrainingArgs, Trainer, VLMTrainingArgs
+from mlx_vlm.trainer.peft import DoRALinear
+
+
+def test_config_cli_precedence_and_algorithm_selection(tmp_path):
+    config = tmp_path / "train.json"
+    config.write_text(
+        json.dumps(
+            {
+                "algorithm": "dpo",
+                "model": "unused",
+                "batch_size": 4,
+                "compile": True,
+                "beta": 0.3,
+            }
+        )
+    )
+    args, settings = parse_args(
+        [
+            "-c",
+            str(config),
+            "--batch-size",
+            "2",
+            "--no-compile",
+        ]
+    )
+    assert isinstance(settings, DPOTrainingArgs)
+    assert settings.batch_size == 2 and settings.beta == 0.3
+    assert not settings.compile
+    assert args.algorithm == "dpo"
+    _, settings = parse_args(
+        ["--model", "unused", "--train-mode", "orpo", "--beta", "0.4"]
+    )
+    assert settings.beta == 0.4
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "dpo", "orpo", "grpo"])
+def test_optimizer_cli_settings_are_separate_from_training_arguments(
+    algorithm, tmp_path
+):
+    config = tmp_path / "optimizer.json"
+    config.write_text(
+        json.dumps(
+            {
+                "model": "unused",
+                "algorithm": algorithm,
+                "optimizer": "sgd",
+                "learning_rate": 0.02,
+                "weight_decay": 0.03,
+            }
+        )
+    )
+    args, settings = parse_args(["-c", str(config), "--learning-rate", "0.01"])
+    assert args.optimizer == "sgd"
+    assert args.learning_rate == 0.01 and args.weight_decay == 0.03
+    for name in ("optimizer", "learning_rate", "weight_decay"):
+        assert not hasattr(settings, name)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--iters", "1", "--epochs", "2"],
+        ["--task", "asr"],
+        ["--algorithm", "infonce"],
+        ["--dataset-config", "[]"],
+        ["--reference-model", "unused"],
+        ["--batch-size", "0"],
+        ["--optimizer", "invalid"],
+        ["--learning-rate", "0"],
+        ["--weight-decay", "-1"],
+    ],
+)
+def test_invalid_cli_options_fail_before_loading(flags):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "unused", *flags])
+
+
+def test_legacy_cli_flags_and_optional_none_values(tmp_path):
+    args, settings = parse_args(
+        [
+            "--model-path",
+            "unused",
+            "--dataset",
+            "owner/data",
+            "--split",
+            "train",
+            "--full-finetune",
+            "--adapter-path",
+            "saved",
+            "--output-path",
+            str(tmp_path),
+            "--steps-per-eval",
+            "none",
+            "--assistant-id",
+            "none",
+            "--cache-size",
+            "none",
+        ]
+    )
+    assert args.model == "unused" and args.dataset == "owner/data"
+    assert args.train_type == "full" and args.resume_adapter_file == "saved"
+    assert settings.adapter_file == str(tmp_path / "adapters.safetensors")
+    assert (
+        settings.steps_per_eval is settings.assistant_id is settings.cache_size is None
+    )
+    assert "--guide-model" not in build_parser().format_help()
+
+
+def test_huggingface_dataset_loading_uses_named_configuration():
+    args, _ = parse_args(
+        [
+            "--model",
+            "unused",
+            "--dataset",
+            "owner/data",
+            "--hf-dataset-config",
+            "images",
+        ]
+    )
+    with patch("datasets.load_dataset", return_value={"train": []}) as load:
+        assert _load_dataset(args) == {"train": []}
+    load.assert_called_once_with("owner/data", "images")
+
+
+class TinyVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="tiny", vocab_size=16)
+        self.embedding = nn.Embedding(16, 64)
+        self.projection = nn.Linear(64, 16)
+
+    def __call__(self, ids, pixels=None, mask=None, **kwargs):
+        return self.projection(self.embedding(ids))
+
+
+def test_cli_raw_rows_prepare_quantize_train_evaluate_and_save(tmp_path):
+    args, settings = parse_args(
+        [
+            "--model",
+            "unused",
+            "--train-type",
+            "dora",
+            "--quantization-bits",
+            "4",
+            "--iters",
+            "3",
+            "--gradient-accumulation-steps",
+            "2",
+            "--train-on-completions",
+            "--max-seq-length",
+            "8",
+            "--pad-to-multiple",
+            "1",
+            "--adapter-file",
+            str(tmp_path / "weights.safetensors"),
+        ]
+    )
+    model = TinyVLM()
+    processor = SimpleNamespace(pad_token_id=0)
+    rows = [{"question": "Which color?", "answer": "red"}]
+
+    def template(processor, config, messages, *, add_generation_prompt, **kwargs):
+        return "prefix" if add_generation_prompt else "full"
+
+    def prepare(**kwargs):
+        ids = [1, 2] if kwargs["prompts"] == ["prefix"] else [1, 2, 3, 4]
+        return {"input_ids": np.array([ids])}
+
+    def build_trainer(prepared, *positional, **kwargs):
+        assert isinstance(kwargs["optimizer"], optim.AdamW)
+        assert isinstance(prepared.projection, DoRALinear)
+        assert isinstance(prepared.projection.linear, nn.QuantizedLinear)
+        return Trainer(prepared, *positional, **kwargs)
+
+    with (
+        patch("mlx_vlm.train._load_model", return_value=(model, processor)),
+        patch(
+            "mlx_vlm.train._load_dataset", return_value={"train": rows, "valid": rows}
+        ),
+        patch("mlx_vlm.train.Trainer", side_effect=build_trainer),
+        patch(
+            "mlx_vlm.trainer.vlm.cross_entropy.dataset._load_vlm_helpers",
+            return_value=({}, template, prepare, None),
+        ),
+    ):
+        metrics = run(args, settings)
+    assert metrics["optimizer_step"] == 2
+    assert mx.isfinite(mx.array(metrics["train_loss"])).item()
+    assert Path(settings.adapter_file).is_file()
+    metadata = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert metadata["fine_tune_type"] == "dora"
+    assert set(metadata["base_quantization"]) == {"embedding", "projection"}
+
+
+def test_trainer_requires_one_split_and_processor_for_raw_rows():
+    with pytest.raises(ValueError, match="processing_class"):
+        Trainer(TinyVLM(), VLMTrainingArgs(), train_dataset=[])
+    with pytest.raises(TypeError, match="one dataset split"):
+        Trainer(
+            TinyVLM(), VLMTrainingArgs(), train_dataset={"train": []}, prepared=True
+        )
+
+
+@pytest.mark.parametrize("qat,force", [(True, None), (False, None), (False, True)])
+def test_cli_qat_export_runs_after_training(tmp_path, qat, force):
+    from unittest.mock import Mock
+
+    args, settings = parse_args(
+        [
+            "--model",
+            "unused",
+            "--train-type",
+            "full",
+            "--export-model-path",
+            str(tmp_path / "packed"),
+            *(["--qat"] if qat else []),
+            *(["--export-quantize"] if force else []),
+        ]
+    )
+    model, processor = TinyVLM(), SimpleNamespace(pad_token_id=0)
+    trainer = Mock()
+    metrics = {"train_loss": 0.5}
+    trainer.train.return_value = metrics
+    with (
+        patch("mlx_vlm.train._load_model", return_value=(model, processor)),
+        patch("mlx_vlm.train._load_dataset", return_value={"train": [{}]}),
+        patch("mlx_vlm.train.Trainer", return_value=trainer),
+        patch("mlx_vlm.export.export_model") as export,
+    ):
+
+        def check_export(*positional, **kwargs):
+            trainer.train.assert_called_once_with()
+            assert isinstance(model.projection, nn.Linear)
+            return tmp_path / "packed"
+
+        export.side_effect = check_export
+        assert run(args, settings) is metrics
+    export.assert_called_once_with(
+        model, processor, str(tmp_path / "packed"), model_path="unused", quantize=force
+    )
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "unused", "--export-quantize"])
+
+
+@pytest.mark.parametrize("qat_flag", [[], ["--qat"]])
+def test_cli_qat_resume_restores_nondefault_quantization(tmp_path, qat_flag):
+    from mlx_vlm.train import _configure_model
+    from mlx_vlm.trainer import prepare_model_for_training
+    from mlx_vlm.trainer.peft import save_adapter
+
+    model = prepare_model_for_training(
+        TinyVLM(),
+        train_type="full",
+        qat=True,
+        quantization_bits=8,
+        quantization_group_size=32,
+        verbose=False,
+    )
+    checkpoint = tmp_path / "weights.safetensors"
+    save_adapter(model, checkpoint)
+    args, _ = parse_args(
+        [
+            "--model",
+            "unused",
+            "--train-type",
+            "full",
+            "--resume-adapter-file",
+            str(checkpoint),
+            *qat_flag,
+        ]
+    )
+    restored = _configure_model(TinyVLM(), args)
+    assert restored.projection.bits == 8
+    assert restored.projection.group_size == 32
+
+
+def test_schedule_warmup_and_updates_count():
+    from mlx_vlm.trainer.common.schedule import build_schedule
+
+    schedule = build_schedule(
+        {
+            "name": "cosine_decay",
+            "warmup": 10,
+            "warmup_init": 1e-7,
+            "arguments": [2e-4, 100, 2e-6],
+        }
+    )
+    assert float(schedule(0)) == pytest.approx(1e-7)
+    assert float(schedule(10)) == pytest.approx(2e-4, rel=1e-3)
+    assert float(schedule(200)) == pytest.approx(2e-6, rel=1e-3)
+    for bad in (
+        {"name": "nope", "arguments": [1e-3]},
+        {"name": "cosine_decay"},
+        {"name": "cosine_decay", "arguments": [1e-3, 10, 0], "warmup": -1},
+    ):
+        with pytest.raises(ValueError):
+            build_schedule(bad)
+
+
+def test_cli_builds_scheduled_adamw_over_updates():
+    from mlx_vlm.train import build_optimizer
+
+    args, settings = parse_args(
+        [
+            "--model",
+            "m",
+            "--warmup-steps",
+            "2",
+            "--lr-schedule",
+            "cosine_decay",
+            "--learning-rate",
+            "1e-3",
+            "--beta2",
+            "0.95",
+            "--optimizer-eps",
+            "1e-6",
+            "--bias-correction",
+            "--grad-clip",
+            "1.0",
+            "--gradient-accumulation-steps",
+            "2",
+        ]
+    )
+    assert settings.grad_clip == 1.0
+    optimizer = build_optimizer(args, 8, 2)  # 4 updates
+    assert isinstance(optimizer, optim.AdamW)
+    assert optimizer.betas == [0.9, 0.95] and optimizer.eps == 1e-6
+    lr = optimizer._schedulers["learning_rate"]
+    assert float(lr(0)) == 0.0 and float(lr(2)) == pytest.approx(1e-3, rel=1e-2)
+    assert float(lr(4)) < 1e-3
+    rates = []
+    for _ in range(4):
+        optimizer.update({}, {})
+        rates.append(float(optimizer.learning_rate))
+    assert rates == pytest.approx([0.0, 5e-4, 1e-3, 5e-4])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--grad-clip", "0"],
+        ["--lr-schedule", "bogus"],
+        ["--warmup-steps", "-1"],
+        ["--optimizer", "sgd", "--beta2", "0.9"],
+    ],
+)
+def test_cli_rejects_bad_schedule_settings(argv):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", "m", *argv])
+
+
+def test_grad_clip_applies_global_norm():
+    from mlx_vlm.trainer.common.utils import apply_accumulated_gradients
+
+    model = nn.Linear(2, 1, bias=False)
+    model.weight = mx.zeros((1, 2))
+    grads = {"weight": mx.array([[30.0, 40.0]])}
+    apply_accumulated_gradients(model, optim.SGD(learning_rate=1.0), grads, 1, 5.0)
+    assert np.allclose(np.array(model.weight), [[-3.0, -4.0]], atol=1e-4)

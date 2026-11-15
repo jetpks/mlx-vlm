@@ -1,33 +1,42 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import secrets
 import sys
 import time
-from contextlib import asynccontextmanager
-from threading import Lock
+from contextlib import asynccontextmanager, nullcontext
+from pathlib import Path
+from threading import Lock, RLock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Annotated, List, Literal, Optional, Tuple
 
 import mlx.core as mx
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse, Response
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
+from ..generate.three_d import load_3d_model
+from ..load_progress import LoadingProgress
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor
+from ..tools import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .continuation import ACTIVE as ACTIVE_CONTINUATION
+from .continuation import ContinuationMiddleware, checkpoint_cleanup
+from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
@@ -44,17 +53,14 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
+from .meshes import register_routes as register_mesh_routes
+from .model_discovery import MODEL_PATHS_ENV, discover_models, model_reasoning_efforts
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
 from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
-from .runtime import (
-    MODEL_DISCOVERY_ENV,
-    MODEL_DISCOVERY_MODES,
-    ModelCacheRegistry,
-    runtime,
-)
+from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -88,41 +94,23 @@ def _require_management_api_key(request: HTTPConnection) -> None:
 
 def _cache_group_for_cache(cache: dict) -> str:
     model_kind = cache.get("model_kind")
-    if model_kind == "image_generation":
-        return "image_generation"
-    if model_kind == "image_edit":
-        return "image_edit"
     if model_kind == "audio_tts":
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
-    if model_kind == "audio":
-        return "audio"
-    if model_kind == "embedding":
-        return "embedding"
-    if model_kind == "reranker":
-        return "reranker"
-    return "text_generation"
+    return model_kind or "text_generation"
 
 
-def _model_discovery_mode() -> str:
-    mode = os.environ.get(MODEL_DISCOVERY_ENV, "served").strip().lower()
-    if mode not in MODEL_DISCOVERY_MODES:
-        logger.warning(
-            "Ignoring invalid %s=%r; using safe default 'served'.",
-            MODEL_DISCOVERY_ENV,
-            mode,
-        )
-        return "served"
-    return mode
-
-
-def _model_info(model_id: str, created: int) -> dict:
+def _model_info(
+    model_id: str, created: int, *, loaded: bool = False, reasoning_efforts=None
+) -> dict:
     model_id = str(model_id)
     return {
         "id": model_id,
         "object": "model",
         "created": created,
+        "loaded": loaded,
+        "reasoning_efforts": reasoning_efforts,
     }
 
 
@@ -133,7 +121,14 @@ def _served_model_entries() -> list[dict]:
         model_id = cache.get("model_path")
         if not model_id:
             continue
-        models[model_id] = _model_info(model_id, created)
+        models[model_id] = _model_info(
+            model_id,
+            created,
+            loaded=True,
+            reasoning_efforts=model_reasoning_efforts(
+                Path(model_id).expanduser(), cache.get("processor")
+            ),
+        )
     return list(models.values())
 
 
@@ -198,6 +193,7 @@ def _server_runtime_snapshot() -> dict:
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
         "preload_failures": dict(runtime.preload_failures),
+        "model_load_progress": runtime.model_load_progress,
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -243,6 +239,15 @@ async def _preflight_stream_context_budget(
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
+    continuation = ACTIVE_CONTINUATION.get()
+    if continuation is not None and continuation.resuming:
+        # The original prompt already passed the context budget check. The GPU
+        # scheduler checks concurrency and memory again when restoring its row.
+        try:
+            continuation.record.session.check()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return
     if runtime.response_generator is None:
         return
     try:
@@ -310,6 +315,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    *,
+    prompt: str = "",
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
     return _split_thinking_text(
@@ -318,6 +325,7 @@ def _split_thinking(
         thinking_end_token,
         starts_in_thinking,
         processor=processor,
+        prompt=prompt,
     )
 
 
@@ -381,14 +389,62 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _reject_native_chat_model_for_audio(model_path: str) -> None:
+    """Reject chat/multimodal checkpoints pointed at the ``/v1/audio/*`` endpoints.
+
+    ``mlx_audio``'s loader autodetects an audio category partly from repo-name tokens
+    (its tts/stt models are named after backbones like ``qwen3``/``llama``/``glm``), so a
+    chat/omni model such as Qwen3-Omni is misrouted into a flat audio config and dies with
+    an opaque ``TypeError`` that surfaces as a 500. Gate on the config ``model_type`` instead:
+    if it resolves to one of mlx-vlm's own model families and ``mlx_audio`` does not recognize
+    the type as a genuine audio model, raise ``ValueError`` so the caller maps it to a 400.
+    """
+    from mlx_audio.utils import get_model_category
+
+    from ..utils import get_model_and_args, get_model_path, load_config
+
+    config = load_config(get_model_path(model_path, allow_patterns=["*.json"]))
+
+    raw_type = (config.get("model_type") or "").lower()
+    if raw_type and get_model_category(raw_type, [raw_type]):
+        return
+
+    try:
+        _, model_type = get_model_and_args(config)
+    except Exception:
+        return
+
+    raise ValueError(
+        f"{model_path!r} is a chat/multimodal model that mlx-vlm serves natively "
+        f"(model_type={model_type!r}); the /v1/audio/* endpoints only support dedicated "
+        "speech-to-text/text-to-speech checkpoints. To use audio with this model, send "
+        "POST /v1/chat/completions with an 'input_audio' content part."
+    )
+
+
 def load_audio_model(model_path: str):
     from mlx_audio.utils import load_model
 
+    _reject_native_chat_model_for_audio(model_path)
     return load_model(model_path)
 
 
 @asynccontextmanager
 async def lifespan(app):
+    from .distributed_launch import managed_workers
+
+    async with managed_workers(runtime.distributed_coordinator):
+        async with _application_lifespan(app):
+
+            try:
+                yield
+            finally:
+                if runtime.cluster_manager is not None:
+                    await runtime.cluster_manager.close()
+
+
+@asynccontextmanager
+async def _application_lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
     adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
@@ -401,6 +457,12 @@ async def lifespan(app):
         logger.info("Language model ready, continuous batching enabled.")
 
     preload_models = (
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_MESH_MODEL", None),
+            None,
+            "mesh_generation",
+            "3D generation model",
+        ),
         (
             os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
             None,
@@ -431,6 +493,12 @@ async def lifespan(app):
             "reranker",
             "reranker model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
+            None,
+            "decision",
+            "decision model",
+        ),
     )
     runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
@@ -458,15 +526,18 @@ async def lifespan(app):
             )
             continue
         logger.info("%s ready.", label.capitalize())
-    try:
-        yield
-    finally:
-        if runtime.audio_queue is not None:
-            runtime.audio_queue.stop_and_join()
-            runtime.audio_queue = None
-        if runtime.realtime_engine is not None:
-            runtime.realtime_engine.stop_and_join()
-            runtime.realtime_engine = None
+    async with checkpoint_cleanup():
+        try:
+            yield
+        finally:
+            if runtime.mesh_jobs is not None:
+                await asyncio.to_thread(runtime.mesh_jobs.shutdown)
+            if runtime.audio_queue is not None:
+                runtime.audio_queue.stop_and_join()
+                runtime.audio_queue = None
+            if runtime.realtime_engine is not None:
+                runtime.realtime_engine.stop_and_join()
+                runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -485,6 +556,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-MLX-Continuation", "X-MLX-Finish-Reason"],
+)
+app.add_middleware(
+    ContinuationMiddleware,
+    authenticate=_require_management_api_key,
+    read_tenant=_read_tenant_id,
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -532,13 +609,24 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
+    from .compaction import chat_cache
+
+    chat_cache.clear()
+    cache.clear()
+    del response_generator, apc_manager
     gc.collect()
     mx.clear_cache()
     return True
 
 
 def _audio_model_kind(model_kind: str) -> bool:
-    return model_kind in ("audio", "audio_tts", "audio_stt")
+    return model_kind in (
+        "audio",
+        "audio_tts",
+        "audio_stt",
+        "audio_diarization",
+        "audio_speaker_embedding",
+    )
 
 
 def _audio_cache_group(model_kind: str) -> str:
@@ -546,7 +634,12 @@ def _audio_cache_group(model_kind: str) -> str:
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
+    if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+        return model_kind
     return "audio"
+
+
+_model_load_lock = RLock()
 
 
 def get_cached_model(
@@ -554,6 +647,27 @@ def get_cached_model(
     adapter_path=_INHERIT_ADAPTER,
     *,
     model_kind: str = "auto",
+    revision: str | None = None,
+):
+    # Text loading runs off the HTTP loop; concurrent callers reuse one loader.
+    # Dedicated audio/image workers retain their own initialization lifecycle.
+    with (
+        _model_load_lock
+        if runtime.distributed_worker is not None
+        or model_kind in ("auto", "text_generation")
+        else nullcontext()
+    ):
+        return _get_cached_model(
+            model_path, adapter_path, model_kind=model_kind, revision=revision
+        )
+
+
+def _get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+    revision: str | None = None,
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
@@ -563,6 +677,8 @@ def get_cached_model(
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
     load_as_reranker = model_kind == "reranker"
+    load_as_decision = model_kind == "decision"
+    load_as_mesh = model_kind == "mesh_generation"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -578,6 +694,12 @@ def get_cached_model(
     elif load_as_reranker:
         cache_group = "reranker"
         effective_model_kind = "reranker"
+    elif load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
+    elif load_as_mesh:
+        cache_group = "mesh_generation"
+        effective_model_kind = "mesh_generation"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -597,6 +719,8 @@ def get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    if revision is not None:
+        cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -615,6 +739,25 @@ def get_cached_model(
     if cached_cache:
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
+
+    if load_as_mesh:
+        if adapter_path is not None:
+            raise HTTPException(400, "Adapters are not supported for 3D generation")
+        model = load_3d_model(model_path, revision=revision)
+        config = SimpleNamespace(model_type="idol", text_config=None)
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": None,
+                "config": config,
+                "model_kind": "mesh_generation",
+            },
+        )
+        return model, None, config
 
     if load_as_edit:
         if adapter_path is not None:
@@ -692,9 +835,14 @@ def get_cached_model(
             )
         logger.info("Loading audio model: %s", model_path)
         try:
-            model = _server_package_attr("load_audio_model", load_audio_model)(
-                model_path
-            )
+            if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+                from .audio_speakers import load_speaker_model
+
+                model = load_speaker_model(model_path, model_kind, revision)
+            else:
+                model = _server_package_attr("load_audio_model", load_audio_model)(
+                    model_path
+                )
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -727,6 +875,42 @@ def get_cached_model(
         }
         registry.set(cache_group, cache)
         return model, None, config
+
+    if load_as_decision:
+        from ..utils import load
+
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400, detail="Decision adapters are not supported"
+            )
+        try:
+            model, processor = load(model_path)
+            if not getattr(model, "decision_types", ()):
+                raise ValueError("This model does not support decision prediction")
+        except RepositoryNotFoundError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_path}"
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load decision model: {error}"
+            ) from error
+        config = model.config
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": processor,
+                "config": config,
+                "model_kind": "decision",
+            },
+        )
+        return model, processor, config
 
     if load_as_embedding:
         if adapter_path is not None:
@@ -868,36 +1052,39 @@ def get_cached_model(
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
         ),
-        overrides={
-            "enabled": cfg.apc_enabled,
-            "disk_path": cfg.apc_disk_path,
-            "block_size": cfg.apc_block_size,
-            "num_blocks": cfg.apc_num_blocks,
-            "disk_max_gb": cfg.apc_disk_max_gb,
-        },
+        overrides=cfg.apc_overrides(),
     )
 
-    response_generator = ResponseGenerator(
-        model_path=model_path,
-        adapter_path=adapter_path,
-        vision_cache=vision_cache,
-        kv_bits=kv_bits,
-        kv_key_bits=kv_key_bits,
-        kv_value_bits=kv_value_bits,
-        kv_key_scheme=kv_key_scheme,
-        kv_value_scheme=kv_value_scheme,
-        kv_group_size=kv_group_size,
-        kv_quant_scheme=kv_quant_scheme,
-        quantized_kv_start=quantized_kv_start,
-        top_logprobs_k=get_top_logprobs_k(),
-        apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.spec_draft_model,
-        draft_kind=cfg.spec_draft_kind,
-    )
+    def publish_loading(event):
+        runtime.model_load_progress = {**event, "adapter_path": adapter_path}
+
+    progress = LoadingProgress(model_path, publish_loading)
+    progress("starting")
+    response_generator = None
     try:
+        response_generator = ResponseGenerator(
+            model_path=model_path,
+            adapter_path=adapter_path,
+            vision_cache=vision_cache,
+            kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
+            kv_key_scheme=kv_key_scheme,
+            kv_value_scheme=kv_value_scheme,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+            top_logprobs_k=get_top_logprobs_k(),
+            apc_manager=runtime.apc_manager,
+            draft_model_path=cfg.draft_model,
+            draft_kind=cfg.draft_kind,
+            load_progress_callback=progress.update,
+        )
         model, processor, config = response_generator.wait_until_ready()
     except Exception:
-        response_generator.stop_and_join()
+        progress("failed")
+        if response_generator is not None:
+            response_generator.stop_and_join()
         vision_cache.clear()
         raise
 
@@ -923,6 +1110,7 @@ def get_cached_model(
     registry.set(cache_group, cache)
     runtime.response_generator = response_generator
     runtime.apc_manager = cache["apc_manager"]
+    progress("ready")
 
     return model, processor, config
 
@@ -930,6 +1118,8 @@ def get_cached_model(
 # Synchronous unload function for internal use
 def unload_model_sync():
     unloaded_any = False
+    if runtime.mesh_jobs is not None:
+        runtime.mesh_jobs.shutdown()
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
             runtime.audio_queue, "is_worker_thread", lambda: False
@@ -950,11 +1140,12 @@ def unload_model_sync():
             unloaded_any = True
 
     registry = _model_cache_registry()
-    for cache_group, _ in list(registry.items()):
+    for cache_group in [key for key, _ in registry.items()]:
         unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
 
     runtime.response_generator = None
     runtime.apc_manager = None
+    runtime.model_load_progress = None
     gc.collect()
     mx.clear_cache()
     if unloaded_any:
@@ -993,6 +1184,8 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
+register_decision_routes(inference_router, _protocol_deps)
+register_mesh_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 
@@ -1003,42 +1196,69 @@ register_reranking_routes(inference_router, _protocol_deps)
     response_model=ModelsResponse,
     include_in_schema=False,
 )
-def models_endpoint():
+def models_endpoint(
+    model_dir: Annotated[
+        Optional[List[str]],
+        Query(
+            description=(
+                "Additional model folder or parent containing model folders on the "
+                "server filesystem. Repeat for multiple paths. Applies only to this "
+                "request, in addition to the cache and configured model directories."
+            )
+        ),
+    ] = None,
+):
     """
-    Return models intentionally served by this process.
+    Return cached and loaded models, indicating which are loaded in this process.
 
-    Set ``MLX_VLM_MODEL_DISCOVERY=hf-cache`` to include compatible-looking
-    repositories from the shared Hugging Face cache for opt-in discovery.
+    Inspect the shared cache, configured directories, and request-specific paths.
     """
     models = {model["id"]: model for model in _served_model_entries()}
 
-    if _model_discovery_mode() == "hf-cache":
-        required_files = {"config.json", "tokenizer_config.json"}
+    try:
+        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+    except CacheNotFound:
+        hf_cache_info = SimpleNamespace(repos=[])
 
-        def probably_mlx_lm(repo):
-            if repo.repo_type != "model" or "main" not in repo.refs:
-                return False
-            file_names = {f.file_path.name for f in repo.refs["main"].files}
-            has_weights = "model.safetensors.index.json" in file_names or any(
-                file_name.endswith(".safetensors") for file_name in file_names
-            )
-            return required_files.issubset(file_names) and has_weights
-
+    loaded_paths = set()
+    for model_id in models:
+        path = Path(model_id).expanduser()
         try:
-            hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-            for repo in hf_cache_info.repos:
-                if probably_mlx_lm(repo) and repo.repo_id not in models:
-                    models[repo.repo_id] = _model_info(
-                        repo.repo_id,
-                        int(repo.last_modified),
-                    )
-        except CacheNotFound:
-            pass
+            if path.is_dir():
+                loaded_paths.add(path.resolve())
+        except (OSError, RuntimeError):
+            continue
+    paths = [p for p in os.environ.get(MODEL_PATHS_ENV, "").split(os.pathsep) if p]
+    paths.extend(p for p in model_dir or [] if p)
+    for model in discover_models(hf_cache_info, paths):
+        if model["id"] not in models and model["path"] not in loaded_paths:
+            models[model["id"]] = _model_info(
+                model["id"],
+                model["created"],
+                reasoning_efforts=model_reasoning_efforts(model["path"]),
+            )
 
     return {
         "object": "list",
         "data": sorted(models.values(), key=lambda model: model["id"].lower()),
     }
+
+
+@inference_router.get("/images/defaults", response_model=ImageSamplingDefaults)
+@inference_router.get(
+    "/v1/images/defaults", response_model=ImageSamplingDefaults, include_in_schema=False
+)
+def image_defaults_endpoint(
+    model: Annotated[str, Query(min_length=1)],
+    task: Literal["generate", "edit"] = "generate",
+):
+    """Resolve sampling defaults using metadata only, without loading weights."""
+    try:
+        return resolve_image_defaults(model, task=task)
+    except NotImplementedError as error:
+        raise HTTPException(status_code=501, detail=str(error)) from error
+    except (ValueError, FileNotFoundError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 app.include_router(inference_router)
@@ -1054,6 +1274,102 @@ async def add_server_header(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def route_distributed_request(request: Request, call_next):
+    from .distributed import CANCEL_ROUTE, REQUEST_HEADER, ROUTES
+
+    path = request.url.path
+    worker = runtime.distributed_worker
+    if path == "/internal/distributed/session":
+        return await call_next(request)
+    if path == CANCEL_ROUTE and request.method == "POST" and worker is not None:
+        try:
+            _require_management_api_key(request)
+            body = await request.json()
+            request_id = body.get("request_id") if isinstance(body, dict) else None
+            if (
+                not isinstance(request_id, str)
+                or len(request_id) != 32
+                or any(c not in "0123456789abcdef" for c in request_id)
+            ):
+                raise HTTPException(422, "Invalid distributed request ID")
+            worker.remember_cancellations([request_id])
+            from . import continuation
+
+            with continuation.CHECKPOINTS.lock:
+                record = continuation.CHECKPOINTS.records.get(request_id)
+            if (
+                record is not None
+                and record.session is not None
+                and record.lease == record.session.lease
+            ):
+                record.session.dispose("Distributed request cancelled")
+            return JSONResponse({"cancelled": request_id}, 202)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"detail": "Invalid cancellation body"}, 422)
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, error.status_code)
+    if request.method != "POST":
+        if worker is not None and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            return JSONResponse(
+                {"detail": "Distributed worker settings are fixed at startup"}, 400
+            )
+        return await call_next(request)
+    if path not in ROUTES:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "This endpoint is unavailable on a distributed worker"}, 400
+            )
+        return await call_next(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return await call_next(request)
+    if not isinstance(body, dict):
+        return await call_next(request)
+    requested = body.get("distributed", False)
+    if not isinstance(requested, bool):
+        return JSONResponse({"detail": "distributed must be a boolean"}, 422)
+    if not requested:
+        if worker is not None:
+            return JSONResponse(
+                {"detail": "Send requests through the distributed coordinator"}, 400
+            )
+        return await call_next(request)
+    try:
+        # Authenticate before downloading, transferring or loading anything.
+        _require_management_api_key(request)
+        if worker is not None:
+            from .distributed_schedule import RequestScope, request_scope
+
+            request_id = request.headers.get(REQUEST_HEADER, "")
+            if len(request_id) != 32 or any(
+                c not in "0123456789abcdef" for c in request_id
+            ):
+                raise HTTPException(
+                    400, "Send requests through the distributed coordinator"
+                )
+            token = request_scope.set(RequestScope(request_id))
+            try:
+                return await call_next(request)
+            finally:
+                request_scope.reset(token)
+        coordinator = runtime.distributed_coordinator
+        if coordinator is None:
+            raise HTTPException(
+                503, "Configure --distributed-config to use distributed=true"
+            )
+        result = await coordinator.relay(path, body, _read_tenant_id(request))
+        if isinstance(result, Response):
+            return result
+        payload, status = result
+        return JSONResponse(payload, status_code=status)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers
+        )
+
+
 @app.get("/health")
 async def health_check(request: Request):
     """
@@ -1061,9 +1377,10 @@ async def health_check(request: Request):
     """
     _require_management_api_key(request)
     runtime = _server_runtime_snapshot()
-    return {
+    result = {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
+        "model_load_progress": runtime["model_load_progress"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_models": runtime["loaded_models"],
         "loaded_context_size": runtime["loaded_context_size"],
@@ -1073,6 +1390,11 @@ async def health_check(request: Request):
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
     }
+    from .runtime import runtime as server_runtime
+
+    if server_runtime.distributed_worker is not None:
+        result["distributed_worker"] = server_runtime.distributed_worker.info()
+    return result
 
 
 @app.get("/metrics")
@@ -1153,14 +1475,17 @@ async def update_runtime_settings(request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     op, values = _settings_operation(payload)
+    before = runtime.config.current()
     applied, rejected = runtime.config.apply_changes(values, op=op)
+    current = runtime.config.current()
+    changed = {name: value for name, value in current.items() if before[name] != value}
     return {
         "op": op,
         "applied": applied,
         "rejected": rejected,
-        "reload_kinds": sorted(runtime.config.reload_kinds(applied)),
+        "reload_kinds": sorted(runtime.config.reload_kinds(changed)),
         "fingerprint": runtime.config.fingerprint(),
-        "current": runtime.config.current(),
+        "current": current,
     }
 
 
@@ -1170,21 +1495,32 @@ async def unload_model_endpoint(request: Request):
     Unload the currently loaded model from memory.
     """
     _require_management_api_key(request)
-    snapshot = _server_runtime_snapshot()
-    unloaded_info = {
-        "model_name": snapshot["loaded_model"],
-        "adapter_name": snapshot["loaded_adapter"],
-        "models": snapshot["loaded_models"],
-    }
+    # Loading now yields the HTTP loop. Do not unload a half-initialized model.
+    if not _model_load_lock.acquire(blocking=False):
+        raise HTTPException(
+            409, {"code": "model_loading", "message": "Retry after loading finishes"}
+        )
+    try:
+        snapshot = _server_runtime_snapshot()
+        unloaded_info = {
+            "model_name": snapshot["loaded_model"],
+            "adapter_name": snapshot["loaded_adapter"],
+            "models": snapshot["loaded_models"],
+        }
 
-    if not unload_model_sync():  # Use the synchronous unload function
-        return {"status": "no_model_loaded", "message": "No model is currently loaded"}
+        if not unload_model_sync():  # Use the synchronous unload function
+            return {
+                "status": "no_model_loaded",
+                "message": "No model is currently loaded",
+            }
 
-    return {
-        "status": "success",
-        "message": "Model unloaded successfully",
-        "unloaded": unloaded_info,
-    }
+        return {
+            "status": "success",
+            "message": "Model unloaded successfully",
+            "unloaded": unloaded_info,
+        }
+    finally:
+        _model_load_lock.release()
 
 
 def main():
@@ -1195,3 +1531,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def _require_cluster_api_key(request: HTTPConnection) -> None:
+    # Mutation and worker identity must never silently become unauthenticated.
+    if _server_api_key() is None:
+        raise HTTPException(
+            503, "Set MLX_VLM_SERVER_API_KEY to enable cluster management"
+        )
+    _require_management_api_key(request)
+
+
+from .cluster import router as _cluster_router
+
+app.include_router(_cluster_router(_require_cluster_api_key))
+
+from .distributed_sessions import router as _session_router
+
+app.include_router(_session_router(_require_cluster_api_key))
+
+
+_cluster_openapi = app.openapi
+
+
+def _openapi_with_stream_events():
+    schema = _cluster_openapi()
+    from .cluster_types import ClusterEvent, GenerationProgress, PromptProgress
+
+    for event in (ClusterEvent, GenerationProgress, PromptProgress):
+        schema["components"]["schemas"][event.__name__] = event.model_json_schema(
+            ref_template="#/components/schemas/{model}"
+        )
+    return schema
+
+
+app.openapi = _openapi_with_stream_events

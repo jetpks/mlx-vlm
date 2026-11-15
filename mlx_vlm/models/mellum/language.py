@@ -105,6 +105,7 @@ class MellumSparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gates = mx.softmax(self.gate(x), axis=-1, precise=True)
         indices = mx.argpartition(gates, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        indices = mx.stop_gradient(indices)
         scores = mx.take_along_axis(gates, indices, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -209,9 +210,14 @@ class LanguageModel(nn.Module):
             logits = self.model.embed_tokens.as_linear(hidden_states)
         else:
             logits = self.lm_head(hidden_states)
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[hidden_states] if kwargs.get("return_hidden") else None,
+            shared_kv_states={} if kwargs.get("return_shared_kv") else None,
+        )
 
     def sanitize(self, weights):
+        weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
@@ -219,15 +225,18 @@ class LanguageModel(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}"
             for name in ("up_proj", "down_proj", "gate_proj"):
-                key = f"{prefix}.mlp.experts.0.{name}.weight"
-                if key in weights:
-                    stacked = [
-                        weights.pop(f"{prefix}.mlp.experts.{expert_idx}.{name}.weight")
-                        for expert_idx in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{name}.weight"] = mx.stack(
-                        stacked
-                    )
+                for suffix in ("weight", "scales", "biases", "weight_global_scale"):
+                    key = f"{prefix}.mlp.experts.0.{name}.{suffix}"
+                    if key in weights:
+                        stacked = [
+                            weights.pop(
+                                f"{prefix}.mlp.experts.{expert_idx}.{name}.{suffix}"
+                            )
+                            for expert_idx in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{name}.{suffix}"] = mx.stack(
+                            stacked
+                        )
         return weights
 
     @property

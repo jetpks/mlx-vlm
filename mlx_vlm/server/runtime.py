@@ -3,9 +3,6 @@ from typing import Any, Dict, Iterator, Optional
 
 from .runtime_config import RuntimeConfig
 
-MODEL_DISCOVERY_ENV = "MLX_VLM_MODEL_DISCOVERY"
-MODEL_DISCOVERY_MODES = ("served", "hf-cache")
-
 
 class ModelCacheRegistry:
     def __init__(self, default_kind: str = "text_generation"):
@@ -65,9 +62,14 @@ class ModelCacheRegistry:
 
 @dataclass
 class ServerRuntime:
+    cluster_manager: Optional[Any] = None
+    distributed_coordinator: Optional[Any] = None
+    distributed_worker: Optional[Any] = None
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
+    model_load_progress: Optional[dict] = None
     audio_queue: Optional[Any] = None
+    mesh_jobs: Optional[Any] = None
     realtime_engine: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None

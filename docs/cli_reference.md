@@ -15,6 +15,7 @@ python -m mlx_vlm convert --help
 python -m mlx_vlm generate --help
 ```
 
+- `mlx_vlm.decide` – predict typed decisions from text, images, or audio and named questions.
 - `mlx_vlm.convert` – convert Hugging Face models to MLX format.
 - `mlx_vlm.generate` – run inference on images, audio, or video.
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.
@@ -22,3 +23,12 @@ python -m mlx_vlm generate --help
 - `mlx_vlm.moe_offload` – repack a MoE checkpoint for expert offloading.
 
 Each command accepts `--help` for full usage information.
+
+For per-request `distributed: true`, start the public server with
+`--distributed-config cluster.json`. Include `launch` settings in that JSON to
+start and stop the worker group automatically over SSH. Omit `launch` when you
+manage `--distributed-worker` processes separately. See
+[distributed serving](distributed-serving.md).
+
+Decision CLI and HTTP examples, including `--decision-model` preloading, are in
+the [decision models guide](https://github.com/Neywa-Labs/mlx-vlm#decision-models).

@@ -144,9 +144,8 @@ class DINOv2Attention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
 
-        attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-        attn = mx.softmax(attn, axis=-1)
-        x = (attn @ v).transpose(0, 2, 1, 3).reshape(B, N, D)
+        x = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        x = x.transpose(0, 2, 1, 3).reshape(B, N, D)
         return self.o_proj(x)
 
 
@@ -338,7 +337,7 @@ class ConvBN(nn.Module):
             padding=padding,
             bias=False,
         )
-        self.bn = nn.LayerNorm(out_channels)
+        self.bn = nn.LayerNorm(out_channels, eps=1e-6)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv(x)
@@ -406,7 +405,7 @@ class MultiScaleProjector(nn.Module):
             num_bottlenecks=config.num_bottlenecks,
             bottleneck_channels=config.bottleneck_channels,
         )
-        final_norm = nn.LayerNorm(config.hidden_dim)
+        final_norm = nn.LayerNorm(config.hidden_dim, eps=1e-6)
         self.stages = [[c2f, final_norm]]
 
     def __call__(self, features: List[mx.array]) -> mx.array:

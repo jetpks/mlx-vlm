@@ -14,7 +14,7 @@ Then check if the model has weights in the
 convert it.
 
 After that, add the model file to the
-[`mlx_vlm/models`](https://github.com/Blaizzy/mlx-vlm/tree/main/src/models)
+[`mlx_vlm/models`](https://github.com/Neywa-Labs/mlx-vlm/tree/main/mlx_vlm/models)
 directory. You can see other examples there. We recommend starting from a model
 that is similar to the model you are porting.
 
@@ -56,20 +56,28 @@ Getting this wrong fails in two ways. A shape-changing conversion applied twice
 dies loudly at weight-load; a value-changing one (a norm shift, a scale rewrite)
 loads fine and generates garbage.
 
-Additionally, add a test for the new model type to the [model
-tests](https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/tests/test_models.py),
-and assert the invariant above with the shared helper:
+Register a small configuration in the case file for the model's task:
 
-```python
-from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
+| Task | Case file | Tests |
+|---|---|---|
+| Text generation | [model_cases.json](mlx_vlm/tests/model_cases.json) | [test_models.py](mlx_vlm/tests/test_models.py) |
+| Image generation | [image_generation_cases.json](mlx_vlm/tests/image_generation_cases.json) | [test_image_generation_models.py](mlx_vlm/tests/test_image_generation_models.py) |
+| Depth, geometry, masks, spans, or decisions | [extraction_cases.json](mlx_vlm/tests/extraction_cases.json) | [test_extraction_models.py](mlx_vlm/tests/test_extraction_models.py) |
 
-sanitized = assert_sanitize_idempotent(model, hf_weights)
-```
+Extraction cases use `id`, `module`, `config`, and `checks`, like text-model
+cases. Shared checks cover `registry_and_config`, `forward`, and `checkpoint`;
+forward checks use `input_shape` and `output_shapes`. Decision models select
+`decision_models` with their `state` and typed `questions` to check standard
+loading and prediction. Specialized tests reuse
+case configs and `shared_configs`, keeping numerical, checkpoint conversion,
+streaming, and IO assertions in Python. Use nonuniform weights to verify
+conversion values and second-pass stability.
 
-From the repository root, you can run the tests with:
+From the repository root, install the test dependencies and run the tests with:
 
 ```shell
-python -m unittest discover mlx_vlm/tests/
+python -m pip install -e ".[test]"
+python -m pytest -q mlx_vlm/tests
 ```
 
 ## Pull Requests
@@ -77,7 +85,10 @@ python -m unittest discover mlx_vlm/tests/
 1. Fork and submit pull requests to the repo.
 2. If you've added code that should be tested, add tests.
 3. Every PR should have passing tests and at least one review.
-4. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
+4. Sign your commits (GPG or SSH) so GitHub marks them **Verified** — see
+   [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
+   PRs with unsigned commits get an automated reminder.
+5. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
    This should install hooks for running `black` and `clang-format` to ensure
    consistent style for C++ and python code.
 

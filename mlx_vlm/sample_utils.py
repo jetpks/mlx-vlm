@@ -6,6 +6,26 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
+MIN_SAMPLING_TEMPERATURE = 0.01
+
+
+@partial(mx.compile, shapeless=True)
+def greedy_argmax(logits: mx.array) -> mx.array:
+    """Select the normalized greedy token without returning vocabulary scores.
+
+    Subtraction can create ties in low precision, so argmax on raw logits is
+    not equivalent to the existing normalized target sampler.
+    """
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return mx.argmax(logprobs, axis=-1)
+
+
+def clamp_temperature(temperature: float) -> float:
+    """Clamp positive sampling temperatures, preserving zero for greedy decoding."""
+    if 0 < temperature < MIN_SAMPLING_TEMPERATURE:
+        return MIN_SAMPLING_TEMPERATURE
+    return temperature
+
 
 def make_sampler(
     temp: float = 0.0,
@@ -25,7 +45,7 @@ def make_sampler(
 
     Args:
         temp (float): The temperature for sampling, if 0 the argmax is used.
-          Default: ``0``.
+          Positive values below 0.01 are clamped to 0.01. Default: ``0``.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): The minimum value (scaled by the top token's
@@ -63,6 +83,7 @@ def make_sampler(
     if temp == 0:
         return lambda x: mx.argmax(x, axis=-1)
 
+    temp = clamp_temperature(temp)
     sampling_methods = []
     if top_n_sigma > 0.0:
         sampling_methods.append(lambda x: apply_top_n_sigma(x, top_n_sigma))
@@ -133,6 +154,10 @@ def make_logits_processors(
 
         logits_processors.append(logit_bias_processor)
 
+    # A unit repetition penalty leaves logits unchanged and needs no processor.
+    if repetition_penalty == 1.0:
+        repetition_penalty = None
+
     repetition_penalties = [
         (make_repetition_penalty, repetition_penalty, repetition_context_size),
         (make_presence_penalty, presence_penalty, presence_context_size),
@@ -158,7 +183,7 @@ def apply_top_k(
         top_k (int): Top k tokens to sample from.
     """
     vocab_size = logprobs.shape[-1]
-    if not isinstance(top_k, int) or not (0 < top_k < vocab_size):
+    if not isinstance(top_k, int) or not (0 < top_k <= vocab_size):
         raise ValueError(
             f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
             f" but is {top_k}."
@@ -295,27 +320,17 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         logprobs: A vector of log probabilities.
         top_p: The cumulative probability threshold for top-p filtering.
     Returns:
-        token selected based on the top-p criterion.
+        Log probabilities with tokens outside the nucleus masked to -inf.
     """
-    probs = mx.exp(logprobs)
-    sorted_indices = mx.argsort(logprobs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
-    )
-    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
-
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    # An exclusive reverse scan keeps the maximum for any
+    # positive top_p without subtracting a tiny probability from 1.
+    sorted_logprobs = mx.sort(logprobs, axis=-1)
+    sorted_probs = mx.exp(sorted_logprobs.astype(mx.float32))
+    mass_above = mx.cumsum(sorted_probs, axis=-1, reverse=True, inclusive=False)
+    total_mass = mass_above[..., :1] + sorted_probs[..., :1]
+    num_dropped = (mass_above >= top_p * total_mass).sum(axis=-1, keepdims=True)
+    threshold = mx.take_along_axis(sorted_logprobs, num_dropped, axis=-1)
+    return mx.where(logprobs < threshold, -float("inf"), logprobs)
 
 
 def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
@@ -329,9 +344,13 @@ def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def _typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
-    p = mx.exp(logprobs)
-    ent = -mx.sum(p * logprobs, axis=-1, keepdims=True)
-    shifted = mx.abs(-logprobs - ent)
+    # Sum in float32: a float16/bfloat16 running sum stops growing once the
+    # remaining probabilities are below its precision.
+    f = logprobs.astype(mx.float32)
+    p = mx.exp(f)
+    # Avoid 0 * -inf for masked tokens.
+    ent = -mx.sum(mx.where(p > 0, p * f, 0.0), axis=-1, keepdims=True)
+    shifted = mx.abs(-f - ent)
     sorted_indices = mx.argsort(shifted, axis=-1)
     sorted_probs = mx.take_along_axis(p, sorted_indices, axis=-1)
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
@@ -387,6 +406,17 @@ def categorical_sampling(logits, temp):
     return mx.random.categorical(logits * (1 / temp))
 
 
+def _penalty_inputs(tokens, logits, context_size):
+    tokens = tokens[-context_size:]
+    if not isinstance(tokens, mx.array):
+        tokens = mx.array(tokens)
+    vocab_size = logits.shape[-1]
+    # Image markers may be negative or beyond the output vocabulary. Route
+    # them to a disposable column without dynamic shapes or a CPU sync.
+    tokens = mx.where((tokens >= 0) & (tokens < vocab_size), tokens, vocab_size)
+    return tokens, mx.pad(logits, [(0, 0), (0, 1)])
+
+
 def make_repetition_penalty(penalty: float, context_size: int = 20):
     """
     Make repetition penalty processor.
@@ -407,7 +437,7 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
 
     def repetition_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             selected_logits = logits[:, tokens]
             selected_logits = mx.where(
                 selected_logits < 0,
@@ -415,6 +445,7 @@ def make_repetition_penalty(penalty: float, context_size: int = 20):
                 selected_logits / penalty,
             )
             logits[:, tokens] = selected_logits
+            logits = logits[:, :-1]
         return logits
 
     return repetition_penalty_processor
@@ -439,8 +470,9 @@ def make_presence_penalty(penalty: float, context_size: int = 20):
 
     def presence_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             logits[:, tokens] -= penalty
+            logits = logits[:, :-1]
         return logits
 
     return presence_penalty_processor
@@ -468,14 +500,21 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
 
     def frequency_penalty_processor(tokens, logits):
         if len(tokens) > 0:
-            tokens = tokens[-context_size:]
+            tokens, logits = _penalty_inputs(tokens, logits, context_size)
             logits = logits.at[:, tokens].subtract(penalty)
+            logits = logits[:, :-1]
         return logits
 
     return frequency_penalty_processor
 
 
-def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.array:
+def top_p_sampling(
+    logits: mx.array,
+    top_p: float,
+    temperature: float,
+    *,
+    key: Optional[mx.array] = None,
+) -> mx.array:
     """
     Apply top-p (nucleus) sampling to logits.
 
@@ -485,32 +524,16 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
             speculative verify output).
         top_p: The cumulative probability threshold for top-p filtering.
         temperature: Temperature parameter for softmax distribution reshaping.
+            Positive values below 0.01 are clamped to 0.01; zero is greedy.
+        key: Optional PRNG key for position-dependent sampling.
     Returns:
         token selected based on the top-p criterion. Shape matches logits
         with the trailing vocab axis removed (e.g. [], [B], or [B, T]).
     """
-    unbatched = logits.ndim == 1
-    if unbatched:
-        logits = logits[None]
-
-    if logits.dtype == mx.bfloat16:
-        logits = logits.astype(mx.float32)
-
-    probs = mx.softmax(logits / temperature, axis=-1)
-
-    sorted_indices = mx.argsort(probs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    top_probs = mx.where(
-        cumulative_probs > 1 - top_p,
-        sorted_probs,
-        mx.zeros_like(sorted_probs),
-    )
-
-    sampled_pos = mx.random.categorical(mx.log(top_probs))
-    token = mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1).squeeze(
-        -1
-    )
-    return token.squeeze(0) if unbatched else token
+    if temperature == 0:
+        return mx.argmax(logits, axis=-1)
+    logits = logits.astype(mx.float32) / clamp_temperature(temperature)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    if 0 < top_p < 1:
+        logprobs = apply_top_p(logprobs, top_p)
+    return mx.random.categorical(logprobs, key=key)

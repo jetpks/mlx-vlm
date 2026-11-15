@@ -14,8 +14,8 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from ..gated_delta import gated_delta_update
-from ..mla import MultiLinear
-from ..switch_layers import SwitchGLU
+from ..mla import MultiLinear, latent_length, max_absorbed_queries
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import TextConfig
 
 
@@ -49,6 +49,7 @@ def group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
     if top_k > 1 and renormalize:
@@ -108,6 +109,7 @@ class ShortConv1d(nn.Module):
         state: Optional[mx.array],
         mask: Optional[mx.array],
         lengths: Optional[mx.array],
+        cache: Optional[ArraysCache] = None,
     ) -> Tuple[mx.array, mx.array]:
         if (
             _short_conv_kernel is not None
@@ -116,6 +118,7 @@ class ShortConv1d(nn.Module):
             and state is not None
             and mask is None
             and lengths is None
+            and cache is None
             and x.dtype == state.dtype
             and x.dtype == self.conv.weight.dtype
             and mx.default_device() == mx.gpu
@@ -141,7 +144,9 @@ class ShortConv1d(nn.Module):
         conv_input = mx.concatenate([state, x], axis=1)
         out = nn.silu(self.conv(conv_input))
         n_keep = self.kernel_size - 1
-        if lengths is not None:
+        if cache is not None:
+            new_state = cache.update_window(0, conv_input, n_keep, lengths=lengths)
+        elif lengths is not None:
             ends = mx.clip(lengths, 0, x.shape[1])
             positions = (ends[:, None] + mx.arange(n_keep))[..., None]
             new_state = mx.take_along_axis(conv_input, positions, axis=1)
@@ -380,7 +385,8 @@ class KimiK3DeltaAttention(nn.Module):
     def _decode_core(self, x, conv_state, ssm_state):
         B = x.shape[0]
         P = self.projection_dim
-        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, None, None)
+        projected = self.qkv_proj(x)
+        qkv, _ = self.qkv_conv(projected, conv_state, None, None)
 
         q = qkv[..., :P].reshape(B, 1, self.num_heads, self.head_dim)
         k = qkv[..., P : 2 * P].reshape(B, 1, self.num_heads, self.head_dim)
@@ -418,7 +424,7 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
             * mx.sigmoid(gate)
         ).reshape(B, 1, -1)
-        return self.o_proj(out), conv_state, ssm_state
+        return (self.o_proj(out), projected), ssm_state
 
     def __call__(
         self,
@@ -448,26 +454,23 @@ class KimiK3DeltaAttention(nn.Module):
         ):
             if conv_state is None:
                 conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
-            if ssm_state is None:
-                ssm_state = mx.zeros(
-                    (B, self.num_heads, self.head_dim, self.head_dim),
-                    dtype=mx.float32,
-                )
             if self._step is None:
                 self._step = mx.compile(self._decode_core)
-            y, conv_state, ssm_state = self._step(x, conv_state, ssm_state)
-            cache[0] = conv_state
-            cache[1] = ssm_state
+            (y, projected), _ = cache.update_recurrent(
+                1, 1, lambda state, _: self._step(x, conv_state, state)
+            )
+            cache.update_window(
+                0, mx.concatenate([conv_state, projected], axis=1), self.conv_kernel - 1
+            )
             cache.advance(1)
             return y
 
         if conv_state is None:
             conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
 
-        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, mask, lengths)
-
-        if cache is not None:
-            cache[0] = conv_state
+        qkv, conv_state = self.qkv_conv(
+            self.qkv_proj(x), conv_state, mask, lengths, cache=cache
+        )
 
         q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
         k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
@@ -491,14 +494,14 @@ class KimiK3DeltaAttention(nn.Module):
             b_logits,
             self.A_log.reshape(self.num_heads, 1),
             self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=ssm_state,
+            state=ssm_state if cache is None else None,
             mask=mask,
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
+            cache=cache,
         )
 
         if cache is not None:
-            cache[1] = ssm_state
             cache.advance(T)
 
         if self.use_full_rank_gate:
@@ -549,6 +552,11 @@ class KimiK3MLAAttention(nn.Module):
         self.unembed_out = MultiLinear(
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
+        self._absorbed_dims = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
         if self.use_gate:
             self.g_proj = nn.Linear(
@@ -588,7 +596,10 @@ class KimiK3MLAAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -599,7 +610,7 @@ class KimiK3MLAAttention(nn.Module):
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
 
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
@@ -791,6 +802,8 @@ class KimiK3TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids=None,
+        hidden_sink=None,
     ) -> mx.array:
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -812,9 +825,12 @@ class KimiK3TextModel(nn.Module):
             attn_mask = None
 
         blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
-        for layer, layer_cache in zip(self.layers, cache):
+        capture = set(capture_layer_ids or [])
+        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
+            if index in capture:
+                hidden_sink.append(h)
 
         if blocks is not None:
             if self.training or self._output_res_w_eff is None:
@@ -851,12 +867,32 @@ class LanguageModel(nn.Module):
         mask: Optional[mx.array] = None,
         **kwargs,
     ):
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        if kwargs.pop("speculative_verify", False):
+            from ...speculative.common import verify_forward
+
+            output, output_state = verify_forward(self, inputs, cache, **kwargs)
+            output.gdn_states = output_state
+            return output
+
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden = [] if capture_layer_ids is not None else None
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden,
+        )
         if self.lm_head is None:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden)
+
+    def rollback_speculative_cache(self, caches, state, accepted, block_size):
+        from ...speculative.cache_state import rollback_speculative_cache
+
+        return rollback_speculative_cache(caches, state, accepted, block_size)
 
     def embed_tokens(self, x):
         return self.model.embed_tokens(x)
@@ -929,7 +965,7 @@ class LanguageModel(nn.Module):
                         )
                         weights[f"{dst_prefix}.switch_mlp.{dst}.scales"] = scales
                     else:
-                        for suffix in ("weight", "scales", "biases"):
+                        for suffix in EXPERT_WEIGHT_SUFFIXES:
                             if f"{src_prefix}.experts.0.{src}.{suffix}" in weights:
                                 weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
                                     mx.stack(
@@ -954,7 +990,7 @@ class LanguageModel(nn.Module):
                     "switch_mlp.up_proj",
                     "switch_mlp.down_proj",
                 ):
-                    for suffix in ("weight", "scales", "biases"):
+                    for suffix in EXPERT_WEIGHT_SUFFIXES:
                         src_key = f"{src_prefix}.{name}.{suffix}"
                         if src_key in weights:
                             weights[f"{dst_prefix}.{name}.{suffix}"] = weights.pop(

@@ -51,6 +51,18 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     pad_token_id: Optional[int] = None
     topk_method: str = "noaux_tc"
+    # Vision is opt-in so configs for the existing text-only checkpoints keep
+    # constructing the language-only model.
+    vision_n_layers: int = 0
+    vision_dim: int = 1024
+    vision_n_heads: int = 16
+    vision_inter_dim: int = 2816
+    vision_patch_size: int = 14
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: int = 3
+    vision_max_n_token: int = 384
+    vision_min_pixels: int = 147456
+    vision_max_wh_ratio: int = 8
 
     def __post_init__(self):
         if not self.compress_ratios:
@@ -69,3 +81,18 @@ class ModelConfig(BaseModelConfig):
         bad = [r for r in self.compress_ratios if r not in (0, 4, 128)]
         if bad:
             raise ValueError(f"Unsupported DeepSeek-V4 compress ratios: {bad}")
+
+
+def validate_sharding(config: dict, world_size: int):
+    """Validate partitioned query heads and expert widths; latent KV is replicated."""
+    args = ModelConfig.from_dict(config)
+    if world_size < 1:
+        raise ValueError("The worker count must be positive")
+    if args.num_attention_heads % (args.o_groups * world_size):
+        raise ValueError(
+            "The query heads in each output group must divide evenly across workers"
+        )
+    if args.moe_intermediate_size % world_size:
+        raise ValueError(
+            "The expert intermediate size must divide evenly across workers"
+        )

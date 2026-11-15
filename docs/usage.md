@@ -35,6 +35,329 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+The CLI, `generate()`, and `stream_generate()` use the checkpoint's
+`generation_config.json` defaults for `temperature`, `top_p`, and `top_k` when
+you omit them (or pass `None` in Python). Missing or null checkpoint values fall
+back to `0.0`, `1.0`, and `0`, respectively. A checkpoint with `do_sample: false`
+defaults to greedy decoding. Explicit sampling options take precedence, so
+`--temperature 0` (or `temperature=0` in Python) always selects greedy decoding,
+while an explicit positive temperature enables sampling. A custom Python
+`sampler` continues to take precedence over these options.
+
+## Streaming tool calls
+
+With `stream: true`, Chat Completions sends argument fragments in
+`choices[0].delta.tool_calls`; Responses sends
+`response.function_call_arguments.delta` events. Accumulate fragments by call
+index (Chat Completions) or item ID (Responses). Execute a tool only after the
+stream completes successfully and its arguments are complete.
+
+Incremental arguments are supported for JSON, Cohere, Qwen Coder XML, and Gemma
+tool formats. Other parsers retain their completed-call behavior. XML values
+that require type conversion are buffered until the parameter closes.
+
+## Continuing a stopped stream
+
+Chat Completions and Responses accept `"stream": true, "resumable": true`.
+The stream returns `X-MLX-Continuation: 1` and a `continuation` object on SSE
+events once generation starts. Save that object atomically with the text from
+the same event. To stop, close the stream. To resume, return the saved object
+unchanged to the same endpoint with the same tenant header:
+
+```python
+requests.post(
+    "http://localhost:8080/v1/responses",
+    headers={"X-APC-Tenant": "my-chat"},
+    json={"stream": True, "continuation": saved_checkpoint},
+    stream=True,
+)
+```
+
+The server retains the live autoregressive decoder: KV and recurrent caches,
+pipelined next tokens, sampling seed and position, logits processors, thinking
+budget, and detokenizer state. Stop pauses scheduling for this request. Resume
+replays any output generated ahead of the client's acknowledged cursor, then
+continues the same decoder without tokenizing or prefilling again. Replacement
+messages and settings are ignored; the original token budget still applies.
+
+Output token counts and decode throughput remain cumulative across resumes.
+Decode timing measures producer work after the first token, excluding paused
+time, replay delivery, and work on other requests. Buffered tokens keep their
+original measurements; receiving them quickly does not inflate the decode rate.
+
+Append the returned text to the interrupted assistant message. Reasoning and
+content already delivered are suppressed, but partial tool arguments are
+replayed in full: discard the old partial tool-call accumulator and execute
+calls only after the resumed stream completes. Each stream returns a new
+checkpoint. A prior handle remains usable for retrying a failed reconnect;
+only the latest reader runs, and a late close from an older stream cannot pause it.
+
+Resumable requests retain individual decoder batches on the existing GPU worker,
+so other requests can run while they are paused. This preserves the decode batch
+shape and keyed sampling sequence across resumes, at the cost of batching
+throughput and retained memory. APC can warm the initial prompt and its entries
+survive Stop; a resume uses its private live state directly and needs no APC
+lookup. Resume also works with APC disabled. Live inference checkpoints are
+separate from APC's shared prefix cache and disk storage.
+
+Checkpoints are process-local, bounded to 32 handles and expire after 2 minutes
+of inactivity. A background sweep runs every 30 seconds, removing expired
+records and their saved request/text even when no new requests arrive. Active
+streams are exempt; closing a stream starts its inactivity window. Expiring an
+older handle does not release a decoder still referenced by another handle.
+Server shutdown clears the remaining records and retained sessions.
+The worker limits paused target-cache buffers to 1 GiB in aggregate
+(`MLX_VLM_CONTINUATION_CACHE_BYTES`), evicting the oldest paused state first.
+A restart, model unload, eviction or expired checkpoint requires regeneration;
+unavailable checkpoints return HTTP 409 rather than silently restarting the
+answer. Authentication and tenant isolation match the original request.
+Diffusion models do not currently support inference checkpoints.
+
+For older transcripts without a checkpoint, `"continue_final_message": true`
+continues an unfinished final assistant message using its template prefix.
+It requires a template that preserves that assistant field and cannot recover
+raw delimiters or generation settings absent from the transcript. Do not combine
+it with `continuation`.
+
+## Conversation compaction and APC
+
+Compaction replaces older conversation turns with a model-generated handoff and
+retains recent turns. Automatic Prefix Caching (APC) then matches the actual
+rendered prompt. Only an unchanged prefix can reuse KV state: retained messages
+after a new summary must be prefilled again because their old KV states depended
+on the discarded history. Repeated continuations can cache the new summary and
+retained turns normally. Compaction also works with APC disabled.
+
+For changing environment snapshots, Chat Completions and Responses accept the
+MLX extension `transient_context` (a string, passed through SDK `extra_body`).
+The server appends it as user context for generation and includes it in token
+counts and context budgets. It is excluded from summary prompts, compaction
+capsules, stored Responses history, and the Chat Completions summary-cache key.
+Send the current snapshot on every request; omitting it removes it from the next
+generation. Keep canonical user turns and tool receipts in `messages`/`input`.
+This prevents a client that replays a capsule and sends fresh environment data
+from accumulating old snapshots. It does not erase snapshots previously sent
+as ordinary messages; rebuild those capsules from the canonical transcript.
+Models may still refer to environment data in their generated output, which
+remains ordinary conversation history. Oversized transient context is subject
+to the same input budget as protected user text.
+
+Clients can also send `tool_result_context` with `entries` containing
+`tool_call_id` and `text`, plus a `max_bytes` budget (512–8192, default 8192).
+These should be exact source excerpts, not new instructions. An entry contributes
+no model tokens while its tool result remains in the resolved conversation.
+When compaction removes that result, the server renders its excerpt in a bounded
+user-context block before the retained conversation. Newly appended tool results
+therefore do not change the recovered prefix. Resend entries with each request;
+they are excluded from summaries, saved history and compaction capsules, just
+like `transient_context`. Token counting includes only the active excerpts.
+
+For text requests with `transient_context`, the server also renders the stable
+conversation without the changing suffix and verifies its shared token prefix.
+Hybrid APC prioritizes a checkpoint at that boundary within its existing entry
+budget. Multimodal requests retain the existing media-safe checkpoint schedule.
+
+Start a server with APC:
+
+```bash
+APC_ENABLED=1 python -m mlx_vlm.server --model openbmb/MiniCPM5-2B --port 8080
+```
+
+There are two ways to manage compaction:
+
+| Client | Integration |
+| --- | --- |
+| [Pi](https://github.com/earendil-works/pi/blob/0f8740bb65638180403a225ad7ec4d0cc1f8dedf/packages/coding-agent/docs/compaction.md) | Keep its session summary and retained-message boundary; send the rebuilt conversation through its normal provider. |
+| [OpenCode](https://github.com/anomalyco/opencode/blob/0112a92c416f5ad833d96e7a8308441f0a875d94/packages/core/src/session/compaction.ts) | Keep its compaction/pruning policy and send summary plus recent messages normally. |
+| [Hermes](https://github.com/NousResearch/hermes-agent/blob/aea969677c60a1bb72fe227fdfb98f196a2092cc/website/docs/developer-guide/context-compression-and-caching.md) | Keep its context compressor; native compaction through a local server needs a client adapter/context-engine integration. |
+| [Codex / Responses protocol](https://developers.openai.com/api/docs/guides/compaction) | Call `/v1/responses/compact`, opt into automatic compaction, or send Codex's terminal `compaction_trigger` on `/v1/responses`. |
+
+Client-owned summaries work through Chat Completions, Messages, or Responses
+without a server-specific marker. Their lifecycle remains the client's
+responsibility. The server never silently rewrites Chat Completions or Messages
+history. These protocols have different client policies. Hermes has protocol
+coverage only.
+
+For explicit server compaction, pass the **whole returned output array** into
+the next request:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed",
+    default_headers={"X-APC-Tenant": "my-workspace"},
+)
+model = "openbmb/MiniCPM5-2B"
+# history is the full Responses input array collected by your agent.
+compacted = client.responses.compact(model=model, input=history)
+response = client.responses.create(
+    model=model,
+    input=[*compacted.output, {"role": "user", "content": "Continue the task."}],
+    max_output_tokens=1024,
+    store=False,
+)
+```
+
+`/responses/compact` is also available without the `/v1` prefix. It is a
+non-streaming endpoint. Optional MLX extensions, passed with SDK `extra_body`,
+are `max_output_tokens` (summary budget; default 1024, maximum 16384) and
+`keep_tokens` (recent-context target; the latest user request and protected tool
+groups always stay). Resend the same `instructions` and `tools` on compaction and
+continuation requests if they were used to render the original prompt. Generated handoffs
+have assistant authority; system/developer messages keep their original roles.
+
+For automatic compaction, add this field to a Responses request:
+
+```json
+{"context_management": [{"type": "compaction", "compact_threshold": 24000}]}
+```
+
+The server checks the rendered input token count **before generation**, including
+for streaming requests. This implementation does not compact mid-generation.
+Only actual input usage triggers compaction; unused `max_output_tokens` (or
+Chat Completions `max_tokens`) does not reserve context or lower the threshold.
+After compaction, generation is capped at the smaller of the requested output
+limit and the remaining context capacity. A short prompt can therefore use a
+Max output setting equal to or larger than the context window. Generation stops
+with a length finish reason if it fills the remaining window; the next request
+can compact that history. Input that leaves no room for generation even after
+compaction is still rejected. Automatic and terminal-trigger compaction can
+summarize oversized history in bounded passes, preserving instructions and
+splitting between user turns or completed tool-call/result groups. Each pass must
+consume an exchange and reduce its input. Oversized tool text is shortened with
+an explicit omission marker while retaining call/result pairing. Protected user
+or instruction text that cannot fit still requires a smaller request. The
+standalone `/responses/compact` endpoint still requires its input to fit.
+Automatic summaries allow up to 512 tokens at 4K and 1024 at 8K, retry once with up
+to twice that budget, and retain labelled partial content if the cap is still reached.
+Both allowances are capped by the space left after the protected tail and handoff
+envelope. A summary that reduces the input and fits the context window can be used
+even if it misses the desired percentage reduction. If early automatic compaction
+cannot meet its budget but the existing input still fits, generation continues with
+that input and the remaining output capacity. Explicit compaction still reports
+unsuccessful reduction, and the hard context limit is enforced on every route.
+Reasoning-only exhaustion falls back to labelled conversation excerpts, not model
+reasoning. Summary prompts close an actually pre-opened thinking suffix when a
+template ignores `enable_thinking=false`. These recovery paths are lossy; they do
+not guarantee factual recall.
+
+When compaction happens, the response output starts with a
+`type: "compaction"` item. Append the output normally, or keep only the newest
+compaction item and everything after it. `previous_response_id` chaining also
+works while that response is stored. `/v1/responses/input_tokens` counts the
+decoded context, not the encrypted payload's string length. Normal response
+usage counts the final inference; explicit compact usage counts the summary pass.
+
+Chat Completions automatically compacts supported history at 75% of the effective
+context limit. `context_management` overrides the threshold; an empty list
+explicitly disables compaction. Recovery supports text, images, and tool history;
+audio/video requests keep their existing behavior. Compaction finishes before the
+Chat Completions stream opens and leaves its response format unchanged.
+
+An in-memory cache reuses compacted exact conversation prefixes when clients resend
+full history. It is scoped by tenant, loaded processor, context limit, and request
+options, expires after ten minutes, and holds at most 32 entries and 2 MB of
+compacted content. Transcript edits or option changes miss the cache; unloading
+the model clears it. This cache is separate from APC and is not durable across
+server restarts. Responses clients can persist and reuse their compaction item.
+
+Streaming automatic compaction and terminal `compaction_trigger` requests emit
+request-scoped MLX extension events after `response.created` / `response.in_progress`
+and before the compaction output item:
+
+```text
+event: mlx.compaction.started
+data: {"type":"mlx.compaction.started","response_id":"resp_...","input_tokens":5786}
+
+event: mlx.compaction.completed
+data: {"type":"mlx.compaction.completed","response_id":"resp_...","input_tokens_before":5786,"input_tokens_after":854}
+```
+
+Use these events to drive a compacting indicator without a token-count preflight.
+`started` means the server has selected history and checked summary headroom;
+`completed` means the smaller context passed validation. No summary means no
+progress events, even if the threshold was reached. The token counts describe the
+rendered conversation before and after compaction, not cache hits or summary usage.
+Clients may ignore these additional events; ordinary Responses output is unchanged.
+Keep the capsule from the accepted final response, not from a progress event.
+
+Once the stream is open, failures are terminal `response.failed` SSE events with
+`response.error.message` and a string `response.error.code` (`invalid_prompt`,
+`context_length_exceeded`, `rate_limit_exceeded`, or `server_error`). They do not produce a successful final
+response. Clear the indicator on failure or disconnect.
+Disconnecting cancels the queued summary worker. Non-streaming compaction still
+reports failures through HTTP status codes.
+
+For native compaction, a single terminal input item
+`{"type": "compaction_trigger"}` on `/v1/responses` requests compaction without
+generating an answer. Both streaming and non-streaming responses contain exactly
+one compaction item, including when the history is too short to shorten. Its
+usage describes the summary pass. Clients can resend a prefix consisting only of
+retained user and system/developer messages before the compaction item. User
+messages already covered by that capsule use its selected originals and summary;
+replaying them does not restore discarded logs. New prefix messages are preserved
+and counted against the context budget. Older capsules without coverage metadata
+preserve the prefix, excluding copies already carried in the capsule. A full
+transcript containing assistant/tool items or older capsules is superseded by the latest
+capsule. Identical system/developer messages resent
+after a capsule replace their carried copies, preventing instruction growth
+across repeated compactions.
+
+The server also retains whole older user messages within a budget of 1/16 of the
+effective context limit, capped at 8192 tokens and the available compaction
+budget. It considers the first user objective, then newest messages, skips messages that do not fit, and
+preserves their original order and roles. Oversized pasted content goes through
+the existing summarizer. This is an MLX retention policy for smaller models, not
+the standalone OpenAI API's documented all-user-messages retention behavior.
+Coverage digests remain inside the encrypted item across repeated compactions
+and restarts. They match content when IDs change, or the original message ID when
+the client truncates a retained message. They add payload bytes but no model
+prompt tokens. Messages after the capsule are new input, even when their text
+repeats earlier messages.
+
+Within a tool loop, the server preserves the latest user request verbatim, the
+latest completed tool group, and every outstanding call with its received results.
+Older completed groups can be summarized without waiting for another user message.
+Parallel calls stay together until all their results arrive. The server accepts a
+summary only if it fits the available budget and reduces removable history to at
+most 60% of its original token count.
+Fixed instructions, tool schemas, and the protected tail are excluded from this
+reduction target. Empty or truncated summaries and insufficient context headroom return an error without
+replacing conversation state. A short conversation with nothing to summarize is
+returned unchanged. A protected message or tool group that exceeds the budget
+still needs to be reduced by the caller. Separate reasoning side-channel items
+follow the normal Responses renderer; this is a textual handoff, not a compressed
+hidden model state.
+
+Compaction items contain authenticated encrypted conversation state, not KV
+tensors. They remain usable after cache eviction or server restart with the same
+model name, tenant, and encryption key. The key is created with owner-only
+permissions at `$MLX_VLM_CACHE_HOME/compaction.key` (default
+`~/.cache/mlx-vlm/compaction.key`); set `MLX_VLM_COMPACTION_KEY_FILE` to use a
+different path or share the key between server processes. Losing/changing the key
+invalidates existing items. OpenAI-issued opaque compaction items are not
+interchangeable with MLX-issued items. `store=False` avoids the Responses registry;
+APC persistence is configured separately.
+
+Run the opt-in HTTP integration tests on Apple Silicon with model access and
+the test extra (including `httpx2`) plus `openai` installed:
+
+```bash
+python -m pip install -e ".[test]" openai
+MLX_VLM_COMPACTION_TEST_MODEL=openbmb/MiniCPM5-2B \
+  python -m pytest -q mlx_vlm/tests/test_server.py::TestCompaction -k real_
+```
+
+These cases exercise SDK compaction/replay, automatic streaming compaction,
+corrections across repeated compaction, cold/warm APC, cache reset, server restart,
+and client-authored summaries through Chat Completions and Messages. Each case
+starts a fresh server and keeps its log in pytest's temporary directory. The
+small synthetic recall task is a regression check, not a general summary-quality
+benchmark. Without the model environment variable, only the real-inference cases
+are skipped; the ordinary compaction protocol tests still run.
+
 ## MoE Offloading
 
 Run a mixture-of-experts checkpoint that is larger than available RAM by paging routed experts from disk. Repack the checkpoint into an offloaded store once, then load it as usual — `load()` detects the offloaded layout automatically:
@@ -237,6 +560,70 @@ python -m mlx_vlm.server
 
 See `README.md` for a complete `curl` example.
 
+### Model loading progress
+
+Library clients can observe the native loader without wrapping tensor evaluation:
+
+```python
+from mlx_vlm import load
+
+model, processor = load("/path/to/model", progress_callback=print)
+```
+
+The callback runs synchronously on the loading thread; keep it short or enqueue
+snapshots for the UI. Each snapshot includes `model`, `stage`, `elapsed_seconds`
+(monotonic elapsed time) and `updated_at` (Unix seconds). Optional stage counts are:
+
+| Stage | Measurement |
+| --- | --- |
+| `loading_checkpoint` | `completed_files`, `total_files`: parsed checkpoint files, not resident weight bytes |
+| `evaluating_layers` | `completed_layers`, `total_layers`: layers whose `mx.eval` has finished |
+| `evaluating_remaining_parameters` | Evaluation of remaining parameters, including multimodal modules |
+
+`stage_percent` is `100 * completed / total`, rounded to two decimal places,
+for checkpoint-file parsing and layer evaluation. It is `null` when the stage
+has no measurable total (including zero layers). This percentage describes only
+the current stage: 100% of layers evaluated does not mean the model is ready.
+File counts are not weighted by size, and neither count estimates total loading
+time. Clients should show an indeterminate indicator for stages with `null`.
+
+Other stages identify work without inventing a percentage: `resolving_model`,
+`converting_weights`, `sanitizing_weights`, `installing_weights`, `loading_adapter`
+and `loading_processor`. `loaded` ends library loading; it includes `lazy`, since
+`lazy=True` still defers parameter evaluation. A loading exception emits `failed`
+and is re-raised. Without a callback, ordinary whole-model evaluation is unchanged.
+
+For the server's text/multimodal chat loader, poll authenticated `GET /health`
+while the first Chat Completions, Responses or Messages request loads the model.
+A token-count request to `/v1/responses/input_tokens` can also warm it up. Start
+without `--model` for this flow: startup preloading still finishes before the
+HTTP server accepts requests. The same snapshot is available under
+`server.model_load_progress` in `/metrics`.
+
+```json
+{
+  "model_load_progress": {
+    "model": "/path/to/model",
+    "adapter_path": null,
+    "stage": "evaluating_layers",
+    "completed_layers": 12,
+    "total_layers": 32,
+    "stage_percent": 37.5,
+    "elapsed_seconds": 4.2,
+    "updated_at": 1794614400.0
+  }
+}
+```
+
+Server stages also include `starting`, `initializing_generator` and `loading_draft`.
+Only `ready` means the generator and cache are ready to serve. The latest snapshot
+remains after readiness or failure; cache hits do not restart it, and `/unload`
+clears it. Unload during initialization returns HTTP 409 with code `model_loading`;
+retry after loading finishes. This is a current snapshot, not an event history or
+loading-cancellation API. Separate image-generation/audio loaders are not covered.
+Distributed workers reuse these measurements and retain their `sharding` and
+`synchronizing` stages through the existing cluster progress API.
+
 ### Live settings (`/v1/settings`)
 
 Read and change a curated set of server settings at runtime, without a
@@ -287,3 +674,22 @@ mlx.launch \
 ```
 
 We recommend you use the JACCL protocol over Thunderbolt. For more information, please refer to [the MLX distributed communication guide](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
+
+
+MiniMax-M3.1-Flash also supports distributed inference through this example. It
+partitions complete routed experts and the untied vocabulary projection across
+ranks, while attention, shared experts and vision remain replicated. The number
+of ranks must divide the routed-expert count. Native MXFP8/NVFP4 checkpoints can
+be loaded directly:
+
+```bash
+mlx.launch --hostfile /path/to/hosts.json --backend jaccl -- \
+    python examples/sharded_generate.py --backend jaccl \
+    --model MiniMaxAI/MiniMax-M3.1-Flash \
+    --prompt "Explain how expert parallel inference works." --max-tokens 128
+```
+
+Use `ring` in both backend arguments for TCP transport. Each rank reconstructs
+expert outputs before BF16 weighting and accumulation, then gathers vocabulary
+logits so all ranks receive the same result. This mode uses expert parallelism;
+MiniMax pipeline parallelism is not implemented.

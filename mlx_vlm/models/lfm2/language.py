@@ -8,6 +8,7 @@ from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     create_ssm_mask,
+    project_logits,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -227,6 +228,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
 
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
@@ -354,6 +356,7 @@ class LanguageModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
+        logits_to_keep: int = 0,
         **kwargs,
     ) -> LanguageModelOutput:
         if inputs is None:
@@ -383,10 +386,12 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
+        projection = (
+            self.model.embed_tokens.as_linear
+            if self.args.tie_word_embeddings
+            else self.lm_head
+        )
+        out = project_logits(out, projection, logits_to_keep)
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,

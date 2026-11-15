@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 import uuid
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -13,7 +14,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -21,12 +26,14 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .openai import _prepare_chat_tool_choice
 from .responses_state import (
+    ThinkingStreamState,
     ToolCallStreamState,
+    finish_content_streams,
     make_response_stream_state,
-    process_tool_calls,
+    parse_assistant_tool_calls,
     prompt_has_open_thinking,
+    strip_protocol_markers,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -299,29 +306,34 @@ def _anthropic_content_blocks_to_text_and_tools(
     role: str,
     content: Union[str, List[Any]],
     images: List[str],
-) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    Union[str, List[Dict[str, Any]]], List[Dict[str, Any]], List[Dict[str, Any]]
+]:
     if isinstance(content, str):
         return content, [], []
 
-    text_parts: List[str] = []
+    content_parts: List[Dict[str, Any]] = []
+    content_images: List[str] = []
+    tool_images: List[str] = []
     tool_calls: List[Dict[str, Any]] = []
     tool_results: List[Dict[str, Any]] = []
     for raw_item in content or []:
         item = _as_plain_dict(raw_item)
         if not isinstance(item, dict):
             if item is not None:
-                text_parts.append(str(item))
+                content_parts.append({"type": "text", "text": str(item)})
             continue
 
         item_type = item.get("type")
         if item_type == "text":
             text = item.get("text")
             if text:
-                text_parts.append(str(text))
+                content_parts.append({"type": "text", "text": str(text)})
         elif item_type == "image" and role == "user":
             image_ref = _anthropic_image_source_to_ref(item.get("source"))
             if image_ref:
-                images.append(image_ref)
+                content_images.append(image_ref)
+                content_parts.append({"type": "image"})
         elif item_type == "tool_use" and role == "assistant":
             tool_calls.append(_anthropic_tool_use_to_openai(item))
         elif item_type == "tool_result" and role == "user":
@@ -330,7 +342,7 @@ def _anthropic_content_blocks_to_text_and_tools(
                     "role": "tool",
                     "tool_call_id": item.get("tool_use_id"),
                     "content": _anthropic_tool_result_content_to_openai(
-                        item.get("content"), images
+                        item.get("content"), tool_images
                     ),
                     "name": item.get("name"),
                 }
@@ -338,9 +350,18 @@ def _anthropic_content_blocks_to_text_and_tools(
         elif item_type in ("thinking", "redacted_thinking"):
             continue
         elif item.get("text"):
-            text_parts.append(str(item["text"]))
+            content_parts.append({"type": "text", "text": str(item["text"])})
 
-    return "\n".join(text_parts).strip(), tool_calls, tool_results
+    # The caller emits the ordinary message before its tool results; keep the
+    # image payloads in that same order, including interleaved tool_result blocks.
+    images.extend(content_images)
+    images.extend(tool_images)
+    content = (
+        content_parts
+        if content_images
+        else "\n".join(part["text"] for part in content_parts).strip()
+    )
+    return content, tool_calls, tool_results
 
 
 def _anthropic_messages_to_internal(
@@ -356,17 +377,15 @@ def _anthropic_messages_to_internal(
         processed_messages.append({"role": "system", "content": system_text})
 
     for message in request.messages:
-        content_text, tool_calls, tool_results = (
-            _anthropic_content_blocks_to_text_and_tools(
-                message.role, message.content, images
-            )
+        content, tool_calls, tool_results = _anthropic_content_blocks_to_text_and_tools(
+            message.role, message.content, images
         )
-        if content_text or tool_calls or not tool_results:
-            msg: Dict[str, Any] = {"role": message.role, "content": content_text}
+        if content or tool_calls or not tool_results:
+            msg: Dict[str, Any] = {"role": message.role, "content": content}
             if tool_calls:
                 msg["tool_calls"] = tool_calls
-                if not content_text:
-                    msg["content"] = None
+                if not content:
+                    msg["content"] = ""
             processed_messages.append(msg)
         processed_messages.extend(tool_results)
 
@@ -441,6 +460,55 @@ def _apply_stop_sequences(
     return text[:best_index], best_sequence
 
 
+class StopSequenceStreamState:
+    """Cut streamed text at the first stop sequence, independent of chunking.
+
+    Text that could still be the start of a stop sequence is held back until
+    it completes or stops matching, so nothing past a match is ever emitted.
+    """
+
+    def __init__(self, stop_sequences: Optional[List[str]]):
+        self.stop_sequences = [s for s in stop_sequences or [] if s]
+        self.pending = ""
+        self.matched: Optional[str] = None
+
+    def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
+        if self.matched is not None:
+            return None
+        if not self.stop_sequences:
+            return text or None
+        self.pending += text or ""
+        emit, matched = _apply_stop_sequences(self.pending, self.stop_sequences)
+        candidate = (
+            len(emit),
+            (
+                self.stop_sequences.index(matched)
+                if matched is not None
+                else len(self.stop_sequences)
+            ),
+        )
+        hold = 0 if last else self._partial_match_length(self.pending, candidate)
+        if matched is not None and not hold:
+            self.matched = matched
+            self.pending = ""
+            return emit or None
+        emit = self.pending[: len(self.pending) - hold]
+        self.pending = self.pending[len(emit) :]
+        return emit or None
+
+    def _partial_match_length(self, text: str, candidate: Tuple[int, int]) -> int:
+        # A partial match can beat a complete match by starting earlier, or
+        # by having the same start and appearing first in stop_sequences.
+        hold = 0
+        for priority, sequence in enumerate(self.stop_sequences):
+            for length in range(min(len(sequence) - 1, len(text)), hold, -1):
+                if text.endswith(sequence[:length]):
+                    if (len(text) - length, priority) < candidate:
+                        hold = length
+                    break
+        return hold
+
+
 def _anthropic_content_from_generation(
     reasoning: Optional[str],
     content: str,
@@ -478,7 +546,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
-        model, processor, config = get_cached_model(request.model, adapter_path)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model, adapter_path
+        )
 
         try:
             processed_messages, images, tools, tool_choice = (
@@ -486,7 +556,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except HTTPException as e:
             return _anthropic_error_response(e.status_code, str(e.detail))
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -509,6 +581,21 @@ async def anthropic_messages_endpoint(http_request: Request):
             num_images=len(images),
             tools=tools,
             **template_kwargs,
+        )
+
+        starts_in_thinking = prompt_has_open_thinking(
+            formatted_prompt,
+            gen_args.enable_thinking,
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
+        parse_tools = partial(
+            parse_assistant_tool_calls,
+            tool_module=tool_module,
+            tools=tools,
+            starts_in_thinking=starts_in_thinking,
+            thinking_start_token=gen_args.thinking_start_token,
+            thinking_end_token=gen_args.thinking_end_token,
         )
 
         logger.debug(
@@ -550,20 +637,23 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = make_response_stream_state(
-                    processor,
-                    prompt_has_open_thinking(
-                        formatted_prompt,
-                        gen_args.enable_thinking,
+
+                def make_thinking_state():
+                    return make_response_stream_state(
+                        processor,
+                        starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
-                    ),
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
+                        prompt=formatted_prompt,
+                    )
+
+                thinking_state = make_thinking_state()
+                tc_start = (
+                    tool_module.tool_call_start if tool_module and tools else None
                 )
-                tc_start = tool_module.tool_call_start if tool_module else None
-                tc_end = tool_module.tool_call_end if tool_module else None
+                tc_end = tool_module.tool_call_end if tool_module and tools else None
                 tool_call_state = ToolCallStreamState(tc_start, tc_end)
+                stop_state = StopSequenceStreamState(request.stop_sequences)
                 message_started = False
 
                 def close_open_block():
@@ -623,6 +713,50 @@ async def anthropic_messages_endpoint(http_request: Request):
                             "message": start_message.model_dump(),
                         },
                     )
+
+                def tool_output_before_stop():
+                    if stop_state.matched is None or not tc_start:
+                        return full_output
+                    call_start = full_output.find(tc_start)
+                    while call_start >= 0:
+                        thinking_prefix = ThinkingStreamState(
+                            starts_in_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
+                        thinking_prefix.feed(full_output[:call_start])
+                        if thinking_prefix.in_thinking:
+                            # An unclosed example in reasoning must not span
+                            # an executable call after the stop marker.
+                            call_start = full_output.find(
+                                tc_start, call_start + len(tc_start)
+                            )
+                            continue
+                        # Match the extractor's non-overlapping call spans,
+                        # including parsers whose calls end at a newline/EOF.
+                        marker = tc_end or "\n"
+                        call_end = full_output.find(marker, call_start + len(tc_start))
+                        if call_end < 0:
+                            if tc_end:
+                                break
+                            call_end = len(full_output)
+
+                        # Compare visible offsets: raw prefixes also contain
+                        # thinking and tool markup, which never reach the
+                        # stop matcher.
+                        prefix = make_thinking_state().feed(
+                            full_output[:call_start], last=True
+                        )
+                        prefix_tools = ToolCallStreamState(tc_start, tc_end)
+                        visible = prefix_tools.feed(prefix.content) or ""
+                        # Whitespace held before a call still precedes that
+                        # call when later visible text releases it.
+                        pending_space = prefix_tools.pending_space
+                        visible += prefix_tools.finish() or pending_space
+                        if len(visible) > len(text_output):
+                            return full_output[:call_start]
+                        call_start = full_output.find(tc_start, call_end + len(marker))
+                    return full_output
 
                 try:
                     if runtime.response_generator is not None:
@@ -693,6 +827,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             delta_content,
                             last=bool(getattr(token, "finish_reason", None)),
                         )
+                        delta_content = stop_state.feed(delta_content)
 
                         if delta_reasoning is not None and gen_args.enable_thinking:
                             yield open_block("thinking")
@@ -738,19 +873,49 @@ async def anthropic_messages_endpoint(http_request: Request):
                                 },
                             )
 
+                        if stop_state.matched is not None:
+                            break
                         if getattr(token, "finish_reason", None):
                             finish_reason = token.finish_reason
                             break
 
+                    tail_reasoning, tail = finish_content_streams(
+                        thinking_state, tool_call_state
+                    )
+                    tail = stop_state.feed(tail, last=True)
                     for event in start_message_event():
                         yield event
+                    if tail_reasoning and gen_args.enable_thinking:
+                        yield open_block("thinking")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": tail_reasoning,
+                                },
+                            },
+                        )
+                    if tail:
+                        text_output += tail
+                        yield open_block("text")
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "text_delta", "text": tail},
+                            },
+                        )
                     yield close_open_block()
 
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
-                        tc = process_tool_calls(full_output, tool_module, tools)
-                        if tc["calls"]:
-                            parsed_tool_calls = tc["calls"]
+                        tc = parse_tools(tool_output_before_stop())
+                        if tc.calls:
+                            parsed_tool_calls = tc.calls
 
                     if parsed_tool_calls:
                         for call in parsed_tool_calls:
@@ -792,11 +957,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             )
                             block_index += 1
 
-                    stop_sequence = None
-                    if not parsed_tool_calls:
-                        _, stop_sequence = _apply_stop_sequences(
-                            text_output, request.stop_sequences
-                        )
+                    stop_sequence = None if parsed_tool_calls else stop_state.matched
 
                     anth_stop_reason = _anthropic_stop_reason(
                         finish_reason,
@@ -962,17 +1123,30 @@ async def anthropic_messages_endpoint(http_request: Request):
                 gen_args.thinking_start_token,
                 gen_args.thinking_end_token,
                 processor=processor,
+                prompt=formatted_prompt,
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
-                tc = process_tool_calls(full_text, tool_module, tools)
-                if tc["calls"]:
-                    parsed_tool_calls = tc["calls"]
-                    _, content = _split_thinking(
-                        tc["remaining_text"] or "",
+                tc = parse_tools(full_text)
+                if tc.calls:
+                    parsed_tool_calls = tc.calls
+                    # Structured templates already removed tool/routing regions
+                    # from the content parsed above. Otherwise use the delimiter
+                    # parser's remainder (reasoning has already been excluded).
+                    if not (
+                        getattr(processor, "response_template", None)
+                        or getattr(
+                            getattr(processor, "tokenizer", None),
+                            "response_template",
+                            None,
+                        )
+                    ):
+                        content = tc.remaining_text or ""
+                    content = strip_protocol_markers(
+                        content,
+                        tool_module,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
-                        processor=processor,
                     )
 
             content, stop_sequence = _apply_stop_sequences(
@@ -1074,7 +1248,9 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
     try:
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
-        model, processor, config = get_cached_model(request.model)
+        model, processor, config = await asyncio.to_thread(
+            get_cached_model, request.model
+        )
         try:
             processed_messages, images, tools, tool_choice = (
                 _anthropic_messages_to_internal(request)
@@ -1101,6 +1277,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                **gen_args.preprocessing_kwargs(),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
@@ -1109,6 +1286,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 images=images if images else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                **gen_args.preprocessing_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except Exception as e:

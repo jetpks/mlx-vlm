@@ -2,6 +2,7 @@ import argparse
 import codecs
 import json
 import logging
+import sys
 import time
 from collections.abc import Sequence
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -23,6 +24,8 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from ..vision_cache import processed_image_key
+from .audio import generate_audio
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -38,17 +41,48 @@ from .common import (
     DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
+    resolve_sampling_defaults,
     wired_limit,
 )
-from .image import (
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-    DEFAULT_IMAGE_TASK,
-    run_image_generation_cli,
-)
+from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
+from .three_d import run_3d_generation_cli
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
+
+
+def _video_sampling(args):
+    """The frame-sampling overrides the user actually set."""
+    from ..utils import VideoSampling
+
+    return VideoSampling(
+        fps=args.fps,
+        nframes=getattr(args, "video_num_frames", None),
+        min_frames=getattr(args, "video_min_frames", None),
+        max_frames=getattr(args, "video_max_frames", None),
+    )
+
+
+def _video_sampling_kwargs(args) -> dict:
+    """``_video_sampling`` flattened for generate()'s keyword interface."""
+    from dataclasses import asdict
+
+    return {k: v for k, v in asdict(_video_sampling(args)).items() if v is not None}
+
+
+def _enable_verbose_logging() -> None:
+    """Surface mlx_vlm's INFO records, such as how a video got sampled."""
+    package_logger = logging.getLogger("mlx_vlm")
+    if not any(
+        getattr(handler, "_mlx_vlm_verbose", False)
+        for handler in package_logger.handlers
+    ):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._mlx_vlm_verbose = True
+        package_logger.addHandler(handler)
+    package_logger.setLevel(logging.INFO)
+
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -62,7 +96,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text, an image, or a video with a supported model."
+        description="Generate text, images, video, audio, or 3D with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -73,18 +107,24 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image", "video"),
+        choices=("text", "image", "video", "audio", "3d"),
         default="text",
         help=(
             "Generate text with a VLM, an image with a supported image model, "
-            "or a video with a supported video model."
+            "a video, speech with an omni model, or 3D Gaussian splats from an image."
         ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image or video generation.",
+        help="Output path for image, video, audio (.wav), or 3D (.ply) generation.",
+    )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference voice audio for --output-modality audio.",
     )
     parser.add_argument(
         "--task",
@@ -108,8 +148,8 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Number of inference steps. Defaults to "
-            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+            "Number of inference steps. Uses the model default for images and 3D "
+            f"and {DEFAULT_VIDEO_STEPS} for videos when omitted."
         ),
     )
     parser.add_argument(
@@ -156,15 +196,15 @@ def parse_arguments():
         "--guidance",
         type=float,
         default=None,
-        help="Classifier-free guidance for image generation/editing.",
+        help="Classifier-free guidance for image generation/editing or 3D generation.",
     )
     parser.add_argument(
         "--prompt-expansion-model",
         type=str,
         default=None,
         help=(
-            "Text model path or Hugging Face repo used to expand plain image "
-            "prompts into Ideogram 4 JSON captions."
+            "Prompt expansion model path or Hugging Face repo. Overrides the "
+            "Flux3 or MiniMax-H3-Image upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(
@@ -201,11 +241,24 @@ def parse_arguments():
         help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
+        "--video-num-frames",
+        type=int,
+        default=None,
+        help="Exact number of frames to sample from --video, overriding --fps.",
+    )
+    parser.add_argument(
+        "--video-min-frames",
+        type=int,
+        default=None,
+        help="Lower bound on the frames sampled from --video.",
+    )
+    parser.add_argument(
         "--video-max-frames",
         type=int,
-        default=16,
-        help="Cap on frames sent when video falls back to ordered images "
-        "(long clips are re-sampled evenly to this count).",
+        default=None,
+        help="Upper bound on the frames taken from --video. Falls back to 16 "
+        "for processors without native video support, which are sent evenly "
+        "re-sampled stills instead.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -338,21 +391,25 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling.",
+        default=None,
+        help="Temperature for sampling. Defaults to the checkpoint setting, "
+        f"or {DEFAULT_TEMPERATURE} if unset. Zero is greedy; positive values below "
+        "0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=DEFAULT_TOP_P,
+        default=None,
         help="Nucleus sampling: keep the smallest set of tokens whose "
-        "probabilities sum to this. 1.0 disables it.",
+        "probabilities sum to this. 1.0 disables it. Defaults to the checkpoint "
+        f"setting, or {DEFAULT_TOP_P} if unset.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=DEFAULT_TOP_K,
-        help="Keep only the k most probable tokens. 0 disables it.",
+        default=None,
+        help="Keep only the k most probable tokens. 0 disables it. Defaults "
+        f"to the checkpoint setting, or {DEFAULT_TOP_K} if unset.",
     )
     parser.add_argument(
         "--min-p",
@@ -534,7 +591,8 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 and Nemotron checkpoints "
+        "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(
         "--draft-kind",
@@ -543,7 +601,7 @@ def parse_arguments():
         choices=["dflash", "eagle3", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "'mtp' (native Multi-Token Prediction / Assistant model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -567,6 +625,17 @@ def parse_arguments():
         help=(
             "Set the chat-template thinking mode when supported. "
             "Choices: enabled, disabled, adaptive."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        type=str.lower,
+        default=None,
+        help=(
+            "Reasoning effort forwarded to the chat template (for example "
+            "low, medium, high). Templates that use reasoning_strength "
+            "receive the same value, matching the server's reasoning_effort "
+            "handling. When omitted, the template default is left untouched."
         ),
     )
     parser.add_argument(
@@ -608,13 +677,48 @@ def normalize_resize_shape(
 
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
-    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
+
+
+def _prepare_generation_inputs(model, processor, prompt, image, audio, video, kwargs):
+    """Prepare multimodal inputs once, or consume caller-prepared tensors."""
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    if kwargs.get("input_ids") is not None:
+        input_ids = kwargs.pop("input_ids")
+        pixel_values = kwargs.pop("pixel_values", None)
+        mask = kwargs.pop("mask", None)
+        return input_ids, pixel_values, mask, dict(kwargs)
+
+    inputs = prepare_inputs(
+        processor,
+        images=image or None,
+        audio=audio or None,
+        videos=video or None,
+        prompts=prompt,
+        image_token_index=getattr(model.config, "image_token_index", None),
+        resize_shape=resize_shape,
+        add_special_tokens=should_add_special_tokens(
+            model.config.model_type, processor
+        ),
+        **kwargs,
+    )
+    data_kwargs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ("input_ids", "pixel_values", "attention_mask")
+    }
+    kwargs.update(data_kwargs)
+    return (
+        inputs.get("input_ids"),
+        inputs.get("pixel_values"),
+        inputs.get("attention_mask"),
+        data_kwargs,
+    )
 
 
 def _prime_cached_prefix_rope_state(
@@ -692,11 +796,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     silent output corruption, or a broadcast crash once speculative decoding wraps
     the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
     (``0`` when the whole cache is reusable), or ``None`` when an entry has already
-    evicted part of the prefix and the caller must cold-prefill instead.
+    evicted part of the prefix, or holds untrimmable state (e.g. the ``ArraysCache``
+    of hybrid/linear-attention layers), and the caller must cold-prefill instead.
     """
     cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
-    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+    if n_drop and not all(
+        c.is_trimmable() and _cache_fully_retained(c) for c in kv_cache
+    ):
         return None
     return n_drop
 
@@ -757,10 +864,6 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
-
-    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
-    image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
@@ -769,33 +872,19 @@ def stream_generate(
     audio = audio or None
     video = video or None
 
-    if kwargs.get("input_ids", None) is not None:
-        input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values", None)
-        mask = kwargs.pop("mask", None)
-    else:
-        inputs = prepare_inputs(
-            processor,
-            images=image,
-            audio=audio,
-            videos=video,
-            prompts=prompt,
-            image_token_index=image_token_index,
-            resize_shape=resize_shape,
-            add_special_tokens=add_special_tokens,
-            **kwargs,
-        )
-        input_ids = inputs.get("input_ids", None)
-        pixel_values = inputs.get("pixel_values", None)
-        mask = inputs.get("attention_mask", None)
-        data_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        kwargs.update(data_kwargs)
+    input_ids, pixel_values, mask, _ = _prepare_generation_inputs(
+        model, processor, prompt, image, audio, video, kwargs
+    )
 
     if is_diffusion_model(model, kwargs):
+        kwargs["temperature"], kwargs["top_p"], kwargs["top_k"] = (
+            resolve_sampling_defaults(
+                model.config,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                top_k=kwargs.get("top_k"),
+            )
+        )
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
@@ -812,13 +901,19 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
+        image_key = processed_image_key(pixel_values, **kwargs)
+        cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached
+        elif hasattr(model, "encode_images"):
+            features = model.encode_images(pixel_values, **kwargs)
+            mx.eval(*features)
+            vision_cache.put(image_key, features)
+            kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn
@@ -854,6 +949,8 @@ def stream_generate(
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
+        else:
+            apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
@@ -892,6 +989,7 @@ def stream_generate(
             # Trim to only new tokens
             input_ids = input_ids[:, prefix_len:]
             pixel_values = None
+            kwargs.pop("pixel_values_videos", None)
             kwargs.pop("cached_image_features", None)
             kwargs["prompt_cache"] = kv_cache
 
@@ -914,6 +1012,7 @@ def stream_generate(
                 reused_prefix_len = plen
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
+                kwargs.pop("pixel_values_videos", None)
                 kwargs.pop("cached_image_features", None)
                 apc_blocks_in_use = matched_blocks
                 _quant_policy = kv_quant_from_legacy(
@@ -969,21 +1068,22 @@ def stream_generate(
         detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
+        exact_checkpoint_lengths = []
         exact_checkpoint = None
-        if (
-            apc_coordinator is not None
-            and apc_coordinator.is_checkpoint
-            and reused_prefix_len == 0
-        ):
-            exact_checkpoint_len = apc_coordinator.checkpoint_len(
-                full_input_ids_list, multimodal_token_ids
-            )
-            if exact_checkpoint_len <= 0:
-                exact_checkpoint_len = None
+        if apc_coordinator is not None and apc_coordinator.is_checkpoint:
+            exact_checkpoint_lengths = [
+                n - reused_prefix_len
+                for n in apc_coordinator.checkpoint_lengths(
+                    full_input_ids_list, multimodal_token_ids, extra_hash=apc_extra_hash
+                )
+                if n > reused_prefix_len
+            ]
+            if exact_checkpoint_lengths:
+                exact_checkpoint_len = exact_checkpoint_lengths[-1]
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
-                    full_input_ids_list[:prefix_len],
+                    full_input_ids_list[: reused_prefix_len + prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
                 )
@@ -995,6 +1095,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            prompt_cache_checkpoint_lengths=exact_checkpoint_lengths,
             verbose=verbose,
             **kwargs,
         )
@@ -1011,7 +1112,7 @@ def stream_generate(
             generated_tokens.append(token)
 
             # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
+            if thinking_criteria is not None and kwargs.get("draft_model") is None:
                 thinking_criteria(token)
 
             # Stop generation if the token is in the eos_token_ids
@@ -1053,6 +1154,7 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
                 finish_reason="length",
+                token_ids=[],
             )
             return
 
@@ -1069,6 +1171,10 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
             finish_reason=finish_reason,
+            token_ids=[
+                int(t.item()) if hasattr(t, "item") else int(t)
+                for t in generated_tokens
+            ],
         )
 
         # Save cache state for potential reuse on next turn
@@ -1118,7 +1224,9 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
+       temperature (float, optional): Sampling temperature. Unset temperature,
+           top_p, and top_k use the checkpoint defaults, then 0.0, 1.0, and 0.
+           An explicit temperature overrides the checkpoint's do_sample flag.
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
@@ -1186,6 +1294,10 @@ def generate(
         text += response.text
         last_response = response
 
+    clean_output = getattr(processor, "clean_output", None)
+    if callable(clean_output):
+        text = clean_output(text)
+
     if last_response is None:
         return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
 
@@ -1207,6 +1319,7 @@ def generate(
     return GenerationResult(
         text=text,
         token=last_response.token,
+        token_ids=last_response.token_ids,
         logprobs=last_response.logprobs,
         prompt_tokens=last_response.prompt_tokens,
         generation_tokens=last_response.generation_tokens,
@@ -1226,13 +1339,24 @@ def generate(
 
 def main():
     args = parse_arguments()
+    output_modality = getattr(args, "output_modality", "text")
 
-    if getattr(args, "output_modality", "text") == "image":
+    if output_modality == "image":
         run_image_generation_cli(args)
         return
-    if getattr(args, "output_modality", "text") == "video":
+    if output_modality == "video":
         run_video_generation_cli(args)
         return
+    if output_modality == "3d":
+        run_3d_generation_cli(args)
+        return
+    if output_modality == "audio":
+        if getattr(args, "output", None) is None:
+            raise ValueError(
+                "--output is required when --output-modality audio is selected"
+            )
+        if args.chat:
+            raise ValueError("--output-modality audio does not support --chat")
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1274,6 +1398,12 @@ def main():
         max_kv_size=args.max_kv_size,
     )
     config = model.config
+    args.temperature, args.top_p, args.top_k = resolve_sampling_defaults(
+        config,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
 
     draft_model = None
     if args.draft_model is not None:
@@ -1327,7 +1457,9 @@ def main():
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
             pair_hook = getattr(model, "prepare_video_frame_pairs", None)
             if pair_hook is not None:
-                frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
+                frames, frame_fps = sample_video_frames(
+                    args.video, args.fps or 2.0, _video_sampling(args)
+                )
                 anchors, first_frames, second_frames = pair_adjacent_frames(
                     frames, max_frames
                 )
@@ -1361,6 +1493,7 @@ def main():
                     images=args.image,
                     fps=args.fps or 2.0,
                     max_frames=max_frames,
+                    sampling=_video_sampling(args),
                 )
                 print(
                     f"{processor.__class__.__name__} has no native video "
@@ -1375,8 +1508,14 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if output_modality == "audio":
+        chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
+    if args.reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = args.reasoning_effort
+        # Muse Glimmer's chat template reads the reasoning_strength alias.
+        chat_template_kwargs["reasoning_strength"] = args.reasoning_effort
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
@@ -1425,6 +1564,9 @@ def main():
             kwargs["thinking_start_token"] = args.thinking_start_token
 
     if args.chat:
+        if args.verbose:
+            _enable_verbose_logging()
+
         from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
@@ -1456,6 +1598,7 @@ def main():
                 "frequency_penalty": args.frequency_penalty,
                 "frequency_context_size": args.frequency_context_size,
                 "vision_cache": vision_cache,
+                **_video_sampling_kwargs(args),
                 **kwargs,
             }
             if args.resize_shape is not None:
@@ -1491,7 +1634,7 @@ def main():
             "image": args.image,
             "audio": args.audio,
             "video": args.video,
-            "fps": args.fps,
+            **_video_sampling_kwargs(args),
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
@@ -1528,7 +1671,15 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        result = generate(
+        if args.verbose:
+            _enable_verbose_logging()
+
+        generate_fn = generate
+        if output_modality == "audio":
+            generate_fn = generate_audio
+            gen_kwargs["output_audio_path"] = args.output
+            gen_kwargs["ref_audio_path"] = args.ref_audio
+        result = generate_fn(
             model,
             processor,
             prompt,
@@ -1536,6 +1687,8 @@ def main():
         )
         if not args.verbose:
             print(result.text)
+        if output_modality == "audio":
+            print(f"Audio written to {result.path}")
 
         if draft_model is not None:
             stats = format_speculative_stats(draft_model)

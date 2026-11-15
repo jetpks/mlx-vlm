@@ -6,8 +6,9 @@ forward order. Diff the two and you should see only PyTorch↔MLX op substitutio
 Three things in here are deliberate reproductions of upstream behaviour that look like bugs.
 Do not "fix" them — the weights were trained with them:
 
-1. `rotate_half` is INTERLEAVED, `(x1,x2,x3,x4) -> (-x2,x1,-x4,x3)`, not the usual split-half.
-   Upstream's own docstring says "to match Source model's implementation."
+1. The rotation is INTERLEAVED, `(x1,x2,x3,x4) -> (-x2,x1,-x4,x3)`, not the usual split-half, so
+   this uses the shared `rotate_half_even_odd` (not `rotate_half`). Upstream's own docstring says
+   "to match Source model's implementation."
 2. The rope frequency table is `concat([freqs, freqs])`, so under an *interleaved* rotation the
    cos/sin at lanes 2i and 2i+1 come from DIFFERENT frequencies. Textbook RoPE pairs equal
    frequencies. This pairing is what the model was trained with; reproduce it exactly.
@@ -21,17 +22,27 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..rope_utils import rotate_half_even_odd
 from .config import VisionConfig
 
 
-def rotate_half(x: mx.array) -> mx.array:
-    """Interleaved rotation: (x1, x2, x3, x4) -> (-x2, x1, -x4, x3)."""
-    shape = x.shape
-    pairs = x.reshape(*shape[:-1], shape[-1] // 2, 2)
-    x_even = pairs[..., 0]
-    x_odd = pairs[..., 1]
-    out = mx.stack([-x_odd, x_even], axis=-1)
-    return out.reshape(*shape)
+class LayerNorm(nn.LayerNorm):
+    """Keep normalization and affine arithmetic in FP32, as in PyTorch."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return mx.fast.layer_norm(
+            x.astype(mx.float32),
+            self.weight.astype(mx.float32),
+            self.bias.astype(mx.float32),
+            self.eps,
+        ).astype(x.dtype)
+
+
+class GELU(nn.Module):
+    """Round once after the FP32 activation, matching the source encoder."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return nn.gelu(x.astype(mx.float32)).astype(x.dtype)
 
 
 def apply_rotary_pos_emb(
@@ -43,15 +54,15 @@ def apply_rotary_pos_emb(
     k = k.astype(mx.float32)
     cos = mx.expand_dims(mx.cos(freqs), axis=1).astype(mx.float32)
     sin = mx.expand_dims(mx.sin(freqs), axis=1).astype(mx.float32)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate_half_even_odd(q) * sin)
+    k_embed = (k * cos) + (rotate_half_even_odd(k) * sin)
     return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
 
 
 def get_norm_layer(config: VisionConfig):
     if config.layer_norm_type == "rms_norm":
         return nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-    return nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+    return LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -152,11 +163,11 @@ class MageVLVisionPatchMerger(nn.Module):
     ):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = nn.LayerNorm(context_dim, eps=layer_norm_eps)
+        self.ln_q = LayerNorm(context_dim, eps=layer_norm_eps)
         # nn.Sequential in upstream -> indices 0 and 2 in the weight names.
         self.mlp = [
             nn.Linear(self.hidden_size, self.hidden_size),
-            nn.GELU(),
+            GELU(),
             nn.Linear(self.hidden_size, dim),
         ]
         self.spatial_merge_size = spatial_merge_size
@@ -230,7 +241,7 @@ class SiglipMLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
         # config.hidden_act is "gelu": the EXACT erf gelu, not the tanh approximation.
-        self.activation_fn = nn.GELU()
+        self.activation_fn = GELU()
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 

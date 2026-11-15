@@ -12,13 +12,18 @@ from ..generate import (
 )
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    GenerationArguments,
     get_log_progress_interval,
+    get_server_max_pixels,
     get_server_max_tokens,
+    get_server_min_pixels,
     get_server_thinking_budget,
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
+from .model_discovery import MODEL_PATHS_ENV
+from .runtime import runtime
+from .runtime_config import RuntimeConfig
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -51,11 +56,36 @@ def main():
         default=None,
         help="Pre-load a language model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
     )
+    distributed_mode = parser.add_mutually_exclusive_group()
+    distributed_mode.add_argument(
+        "--distributed-config",
+        help="Cluster JSON for distributed=true; an optional launch section starts workers automatically.",
+    )
+    distributed_mode.add_argument(
+        "--distributed-worker",
+        action="store_true",
+        help="Run a dedicated collective worker under mlx.launch, not a public coordinator.",
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("jaccl", "ring", "mpi", "nccl"),
+        default="jaccl",
+    )
+    parser.add_argument(
+        "--distributed-model-dir",
+        help="Absolute shared staging path on every distributed worker.",
+    )
     parser.add_argument(
         "--image-model",
         type=str,
         default=None,
         help="Pre-load an image generation model at startup.",
+    )
+    parser.add_argument(
+        "--mesh-model",
+        type=str,
+        default=None,
+        help="Pre-load an image-to-3D model for /v1/meshes.",
     )
     parser.add_argument(
         "--tts-model",
@@ -76,19 +106,24 @@ def main():
         help="Pre-load an embedding model at startup.",
     )
     parser.add_argument(
+        "--decision-model",
+        type=str,
+        default=None,
+        help="Pre-load a decision model at startup.",
+    )
+    parser.add_argument(
         "--reranker-model",
         type=str,
         default=None,
         help="Pre-load a supported reranker model at startup.",
     )
     parser.add_argument(
-        "--model-discovery",
-        choices=MODEL_DISCOVERY_MODES,
+        "--model-dir",
+        action="append",
         default=None,
         help=(
-            "Models exposed by /v1/models: 'served' lists only models loaded by "
-            "this process (default); 'hf-cache' also scans the shared Hugging "
-            "Face cache. Maps to MLX_VLM_MODEL_DISCOVERY."
+            "Additional model directory, or parent directory containing model folders. "
+            "Repeat for multiple paths. Overrides MLX_VLM_MODEL_PATHS."
         ),
     )
     parser.add_argument(
@@ -104,10 +139,23 @@ def main():
         help="Max number of cached vision features (default: 20).",
     )
     parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=get_server_min_pixels(),
+        help="Default minimum image pixel area for supported processors; requests may override it.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=get_server_max_pixels(),
+        help="Default maximum image pixel area for supported processors; requests may override it.",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
-        help="Tokens per prefill step (default: %(default)s).",
+        help="Prompt-token budget per batch step, including padding "
+        "(default: %(default)s). Lower values reduce pauses in active streams.",
     )
     parser.add_argument(
         "--log-progress-interval",
@@ -232,8 +280,8 @@ def main():
         type=str,
         default=None,
         help=(
-            "Speculative drafter path or HF id "
-            "(e.g. z-lab/Qwen3.5-4B-DFlash, google/gemma-4-31B-it-assistant)."
+            "Speculative drafter path or HF id. Qwen3.5/3.6/3.8 checkpoints "
+            "with bundled MTP weights can use the same path as --model."
         ),
     )
     parser.add_argument(
@@ -241,7 +289,7 @@ def main():
         type=str,
         default=None,
         choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
+        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (native/assistant MTP). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -293,6 +341,63 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    if args.distributed_config or args.distributed_worker:
+        if args.reload:
+            parser.error("Distributed serving does not support --reload")
+        if not (args.api_key or os.environ.get("MLX_VLM_SERVER_API_KEY")):
+            parser.error(
+                "Distributed serving requires --api-key or MLX_VLM_SERVER_API_KEY"
+            )
+    if args.distributed_worker:
+        if not args.distributed_model_dir or not os.path.isabs(
+            args.distributed_model_dir
+        ):
+            parser.error(
+                "--distributed-worker requires an absolute --distributed-model-dir"
+            )
+        if any(
+            (
+                args.model,
+                args.adapter_path,
+                args.draft_model,
+                args.image_model,
+                args.mesh_model,
+                args.tts_model,
+                args.stt_model,
+                args.embedding_model,
+                args.decision_model,
+                args.reranker_model,
+            )
+        ):
+            parser.error(
+                "Distributed workers load coordinator-staged models on demand; preloads, adapters and drafters are unsupported"
+            )
+        if any(
+            name.startswith("MLX_VLM_PRELOAD_") for name in os.environ
+        ) or os.environ.get("MLX_VLM_DRAFT_MODEL"):
+            parser.error(
+                "Remove model preload/draft environment settings from distributed workers"
+            )
+        try:
+            worker_limit = int(
+                args.max_num_seqs
+                if args.max_num_seqs is not None
+                else os.environ.get("MLX_VLM_MAX_NUM_SEQS", "4")
+            )
+            if worker_limit < 1:
+                raise ValueError
+        except ValueError:
+            parser.error(
+                "Distributed workers require a positive --max-num-seqs / MLX_VLM_MAX_NUM_SEQS"
+            )
+    try:
+        GenerationArguments(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.min_pixels is not None:
+        os.environ["MLX_VLM_MIN_PIXELS"] = str(args.min_pixels)
+    if args.max_pixels is not None:
+        os.environ["MLX_VLM_MAX_PIXELS"] = str(args.max_pixels)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
@@ -301,16 +406,22 @@ def main():
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     if args.image_model:
         os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] = args.image_model
+    if args.mesh_model:
+        os.environ["MLX_VLM_PRELOAD_MESH_MODEL"] = args.mesh_model
     if args.tts_model:
         os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
     if args.stt_model:
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     if args.embedding_model:
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
+    if args.decision_model:
+        os.environ["MLX_VLM_PRELOAD_DECISION_MODEL"] = args.decision_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
-    if args.model_discovery:
-        os.environ[MODEL_DISCOVERY_ENV] = args.model_discovery
+    if args.model_dir is not None:
+        os.environ[MODEL_PATHS_ENV] = os.pathsep.join(
+            os.path.abspath(os.path.expanduser(path)) for path in args.model_dir
+        )
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
@@ -353,6 +464,32 @@ def main():
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
 
+    if args.distributed_config:
+        from .distributed import ClusterConfig, Coordinator
+
+        try:
+            runtime.distributed_coordinator = Coordinator(
+                ClusterConfig.read(args.distributed_config)
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"Invalid distributed configuration: {exc}")
+    elif args.distributed_worker:
+        from huggingface_hub import constants as hub_constants
+
+        from .distributed import DistributedWorker
+
+        # Admission is synchronized across ranks by the native generation thread.
+        os.environ.setdefault("MLX_VLM_MAX_NUM_SEQS", "4")
+        os.environ["APC_ENABLED"] = "0"
+        os.environ["APC_DISK_ENABLED"] = "0"
+        os.environ["MLX_VLM_VISION_CACHE_SIZE"] = "0"
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        # Hub has already been imported by the server; update its cached flag too.
+        hub_constants.HF_HUB_OFFLINE = True
+        runtime.distributed_worker = DistributedWorker(
+            args.distributed_backend, args.distributed_model_dir
+        )
+
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
@@ -360,6 +497,9 @@ def main():
     )
     logger.setLevel(log_level)
 
+    # The runtime was imported before CLI flags populated the environment.
+    # Capture the final startup values for live settings and replace/reset.
+    runtime.config = RuntimeConfig.from_env()
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,

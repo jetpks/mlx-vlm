@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Generator, List, Optional
 
 import mlx.core as mx
@@ -15,6 +16,7 @@ from ..models.diffusion_visualizer import (
     display_width,
     escape_carriage_returns,
 )
+from ..sample_utils import clamp_temperature
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -291,8 +293,14 @@ def _diffusion_initialize_canvas(
     canvas_length: int,
     vocab_size: int,
     dtype,
+    rng=None,
 ) -> mx.array:
-    return mx.random.randint(0, vocab_size, (batch_size, canvas_length)).astype(dtype)
+    return mx.random.randint(
+        0,
+        vocab_size,
+        (batch_size, canvas_length),
+        key=rng() if rng is not None else None,
+    ).astype(dtype)
 
 
 def _normalize_decoder_input_ids(
@@ -323,6 +331,7 @@ def _diffusion_initial_canvas(
     canvas_length: int,
     vocab_size: int,
     dtype,
+    rng=None,
 ) -> mx.array:
     seed_canvas = None
     seed_length = 0
@@ -338,6 +347,7 @@ def _diffusion_initial_canvas(
         canvas_length,
         vocab_size,
         dtype,
+        rng=rng,
     )
     if seed_canvas is None:
         return random_canvas
@@ -362,13 +372,17 @@ def _diffusion_sample_canvas(
     processed_logits: mx.array,
     dtype,
     temperature: float,
+    rng=None,
 ) -> mx.array:
+    temperature = clamp_temperature(temperature)
     logits = processed_logits.astype(mx.float32)
     if temperature <= 0:
         return mx.argmax(logits, axis=-1).astype(dtype)
     if temperature != 1.0:
         logits = logits / temperature
-    return mx.random.categorical(logits).astype(dtype)
+    return mx.random.categorical(logits, key=rng() if rng is not None else None).astype(
+        dtype
+    )
 
 
 def _diffusion_token_probability(
@@ -563,6 +577,7 @@ def stream_diffusion_generate(
     decoder_input_ids: Optional[mx.array] = None,
     apc_manager: Optional[Any] = None,
     apc_extra_hash: int = 0,
+    rng=None,
 ) -> Generator[GenerationResult, None, None]:
     if input_ids.shape[0] != 1:
         raise ValueError(
@@ -668,7 +683,7 @@ def stream_diffusion_generate(
     apc = None
     apc_hit = None
     cached_tokens = 0
-    checkpoint_len = 0
+    checkpoint_lengths = []
     full_token_ids = [int(token_id) for token_id in input_ids[0].tolist()]
     prompt_tic = time.perf_counter()
     if apc_manager is not None and not diffusion_static_cache:
@@ -683,6 +698,7 @@ def stream_diffusion_generate(
         candidate = APCCoordinator(apc_manager, model)
         if candidate.enabled and candidate.is_checkpoint:
             apc = candidate
+            apc.prepare_prefill(len(full_token_ids))
             media_token_ids = multimodal_token_ids_from_config(model.config)
             safe_lookup_min = max(
                 0,
@@ -705,7 +721,9 @@ def stream_diffusion_generate(
                     media_token_ids,
                 ),
             )
-            checkpoint_len = apc.checkpoint_len(full_token_ids, media_token_ids)
+            checkpoint_lengths = apc.checkpoint_lengths(
+                full_token_ids, media_token_ids, extra_hash=int(apc_extra_hash or 0)
+            )
             if apc_hit is not None:
                 cached_tokens = int(apc_hit.get("prefix_len", 0) or 0)
 
@@ -852,16 +870,20 @@ def stream_diffusion_generate(
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
             if is_prefill:
                 prefill_start = cached_tokens
-                if checkpoint_len > prefill_start:
+                checkpoint_saved = cached_tokens > 0
+                for checkpoint_len in checkpoint_lengths:
+                    if checkpoint_len <= prefill_start:
+                        continue
                     prefill_range(prefill_start, checkpoint_len)
-                    apc.store_checkpoint(
+                    stored = apc.store_checkpoint(
                         full_token_ids[:checkpoint_len],
                         kv_cache,
                         extra_hash=int(apc_extra_hash or 0),
                     )
+                    checkpoint_saved = checkpoint_saved or stored
                     prefill_start = checkpoint_len
                 prefill_range(prefill_start, prompt_length)
-                if apc is not None:
+                if apc is not None and not checkpoint_saved:
                     apc.commit(
                         kv_cache,
                         full_token_ids,
@@ -904,6 +926,7 @@ def stream_diffusion_generate(
                 canvas_length,
                 vocab_size,
                 input_ids.dtype,
+                rng=rng,
             )
             draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
             draft_canvas = current_canvas
@@ -998,6 +1021,7 @@ def stream_diffusion_generate(
                         processed_logits,
                         input_ids.dtype,
                         temperature,
+                        rng=rng,
                     )
                 )
 
@@ -1028,6 +1052,7 @@ def stream_diffusion_generate(
                             canvas_length,
                             vocab_size,
                             input_ids.dtype,
+                            rng=rng,
                         ),
                     )
                     draft_reveal_mask = acceptance_mask
@@ -1058,6 +1083,7 @@ def stream_diffusion_generate(
                             canvas_length,
                             vocab_size,
                             input_ids.dtype,
+                            rng=rng,
                         ),
                     )
                     draft_reveal_mask = draft_reveal_mask | acceptance_mask
@@ -1241,7 +1267,9 @@ def _stream_model_diffusion_generate(
 
     top_p_arg = None if top_p is None or top_p >= 1.0 else top_p
     top_k_arg = None if top_k is None or top_k <= 0 else top_k
-    generated = model.language_model.generate(
+    generate_blocks = getattr(model.language_model, "generate_blocks", None)
+    generate = generate_blocks or model.language_model.generate
+    generated = generate(
         input_ids,
         temperature=temperature,
         block_length=block_length,
@@ -1262,6 +1290,19 @@ def _stream_model_diffusion_generate(
         **tuned_kwargs,
         **kwargs,
     )
+    if generate_blocks is not None:
+        blocks = generated
+        try:
+            while True:
+                try:
+                    next(blocks)
+                except StopIteration as done:
+                    generated = done.value
+                    break
+                yield from pending_results
+                pending_results.clear()
+        finally:
+            blocks.close()
     mx.eval(generated)
 
     if generation_stats.get("text_already_printed"):
@@ -1343,7 +1384,10 @@ def stream_diffusion_generate_from_kwargs(
     if stream_strategy is None:
         raise ValueError("Model does not support diffusion generation.")
 
-    with wired_limit(model, [generation_stream]):
+    manage_wired_limit = kwargs.pop("manage_wired_limit", True)
+    with (
+        wired_limit(model, [generation_stream]) if manage_wired_limit else nullcontext()
+    ):
         yield from stream_strategy(
             model,
             processor,

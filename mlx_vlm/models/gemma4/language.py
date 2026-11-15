@@ -11,9 +11,42 @@ from ..base import (
     create_causal_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache, RotatingKVCache
+from ..cache import BatchKVCache, BatchRotatingKVCache, KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import TextConfig
+from .speculative_verifier import Gemma4ExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = Gemma4ExactSpeculativeVerifier()
+
+
+def _batch_shared_kv(cache):
+    """Read committed rows without extracting, padding and rejoining caches."""
+    rotating = isinstance(cache, BatchRotatingKVCache)
+    rotated = rotating and cache.rotated
+    origin = cache._idx % cache.keys.shape[2] if rotated else 0
+    end = cache.max_size if rotated else cache._idx
+    window_start = max(0, end - cache.max_size) if rotating else 0
+    starts = [max(window_start, pad) for pad in cache.left_padding.tolist()]
+    lengths = [max(0, end - start) for start in starts]
+    length = max(lengths)
+    tensors = (cache.keys, cache.values)
+    # The usual unpadded layout, including a single row, only needs views.
+    if (
+        min(starts) == max(starts)
+        and origin + starts[0] + length <= tensors[0].shape[2]
+    ):
+        start = origin + starts[0]
+        return tuple(tensor[..., start : start + length, :] for tensor in tensors)
+
+    positions = mx.arange(length)[None, :]
+    indices = (mx.array(starts)[:, None] + positions + origin) % tensors[0].shape[2]
+    valid = (positions < mx.array(lengths)[:, None])[:, None, :, None]
+    return tuple(
+        mx.where(
+            valid, mx.take_along_axis(tensor, indices[:, None, :, None], axis=2), 0
+        )
+        for tensor in tensors
+    )
 
 
 @partial(mx.compile, shapeless=True)
@@ -91,6 +124,7 @@ class Router(nn.Module):
         )
         top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
 
+        top_k_indices = mx.stop_gradient(top_k_indices)
         top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
         top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
@@ -157,7 +191,11 @@ class Attention(nn.Module):
         self.use_k_eq_v = (
             getattr(config, "attention_k_eq_v", False) and not self.is_sliding
         )
-        if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+        if (
+            not self.is_sliding
+            and config.num_global_key_value_heads is not None
+            and (self.use_k_eq_v or config.per_layer_config is not None)
+        ):
             self.n_kv_heads = config.num_global_key_value_heads
         else:
             self.n_kv_heads = config.num_key_value_heads
@@ -558,6 +596,7 @@ class Gemma4TextModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         hidden_sink: Optional[list] = None,
         shared_kv_sink: Optional[dict] = None,
+        logits_to_keep: Optional[int] = None,
         **kwargs,
     ):
         if inputs_embeds is None:
@@ -609,6 +648,16 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = [None] * len(self.layers)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        keep = int(logits_to_keep) if logits_to_keep else 0
+        trim_before_layer = self.first_kv_shared_layer_idx
+        if hidden_sink is not None:
+            if capture_set:
+                trim_before_layer = max(trim_before_layer, max(capture_set) + 1)
+            else:
+                # return_hidden without explicit capture ids records the final
+                # decoder output, whose historical full-width shape is public.
+                trim_before_layer = len(self.layers)
+        trimmed_prefix = 0
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, m, prev_idx, pli) in enumerate(
             zip(
@@ -619,7 +668,16 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs,
             )
         ):
+            if 0 < keep < h.shape[1] and idx == trim_before_layer:
+                trimmed_prefix = h.shape[1] - keep
+                h = h[:, -keep:, :]
+            if pli is not None and pli.shape[1] != h.shape[1]:
+                pli = pli[:, -h.shape[1] :, :]
+            if isinstance(m, mx.array) and m.shape[-2] != h.shape[1]:
+                m = m[..., -h.shape[1] :, :]
             kvs, offset = intermediates[prev_idx]
+            if trimmed_prefix:
+                offset = offset + trimmed_prefix
             h, kvs, offset = layer(
                 h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
             )
@@ -650,8 +708,6 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -670,6 +726,76 @@ class LanguageModel(nn.Module):
 
     def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
         return self.model.norm(hidden)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        from ...speculative.cache_state import start_speculative_cache
+
+        transaction = start_speculative_cache(cache, inputs.shape[1])
+        shared_kv = {}
+        try:
+            hidden = self.model(
+                inputs,
+                cache=cache,
+                shared_kv_sink=shared_kv,
+                skip_final_norm=True,
+            )
+            return hidden, shared_kv, transaction
+        except BaseException:
+            transaction.abort()
+            raise
+
+    def shared_kv_from_cache(self, caches):
+        """Return committed context in temporal order, with per-row padding."""
+        from ..base import dequantize_kv_state
+
+        selected = {
+            layer.layer_type: cache
+            for layer, cache in zip(self.model.layers, caches)
+            if cache is not None
+        }
+        shared = {}
+        for layer_type, cache in selected.items():
+            if isinstance(cache, (BatchKVCache, BatchRotatingKVCache)):
+                if cache.keys is not None and cache.values is not None:
+                    shared[layer_type] = _batch_shared_kv(cache)
+                continue
+            rows = (
+                [cache.extract(i) for i in range(cache.batch_size)]
+                if hasattr(cache, "batch_size") and hasattr(cache, "extract")
+                else [cache]
+            )
+            states = []
+            for row in rows:
+                keys, values = row.state[:2]
+                if isinstance(row, RotatingKVCache):
+                    keys, values = row._temporal_order(keys), row._temporal_order(
+                        values
+                    )
+                    keys = keys[..., -row.max_size :, :]
+                    values = values[..., -row.max_size :, :]
+                states.append(dequantize_kv_state(row, keys, values))
+            if len(states) == 1:
+                shared[layer_type] = states[0]
+                continue
+            length = max(keys.shape[2] for keys, _ in states)
+            shared[layer_type] = tuple(
+                mx.concatenate(
+                    [
+                        mx.pad(
+                            state[index],
+                            (
+                                (0, 0),
+                                (0, 0),
+                                (0, length - state[index].shape[2]),
+                                (0, 0),
+                            ),
+                        )
+                        for state in states
+                    ]
+                )
+                for index in range(2)
+            )
+        return shared
 
     def chunked_prefill_policy(
         self,
@@ -717,6 +843,36 @@ class LanguageModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
+        if kwargs.pop("speculative_verify", False):
+            from ...speculative.cache_state import start_speculative_cache
+
+            tokens = inputs if inputs is not None else inputs_embeds
+            transaction = start_speculative_cache(cache or [], tokens.shape[1])
+            try:
+                if getattr(self.config, "exact_speculative_verify", False):
+                    output = _EXACT_SPECULATIVE_VERIFIER(
+                        self,
+                        inputs,
+                        cache=cache,
+                        input_embeddings=inputs_embeds,
+                        capture_layer_ids=capture_layer_ids,
+                    )
+                else:
+                    output = self(
+                        inputs,
+                        inputs_embeds=inputs_embeds,
+                        mask=mask,
+                        cache=cache,
+                        per_layer_inputs=per_layer_inputs,
+                        capture_layer_ids=capture_layer_ids,
+                        **kwargs,
+                    )
+                output.gdn_states = transaction
+                return output
+            except BaseException:
+                transaction.abort()
+                raise
+
         hidden_sink: Optional[list] = (
             []
             if capture_layer_ids is not None or kwargs.pop("return_hidden", False)
@@ -739,6 +895,7 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
             shared_kv_sink=shared_kv_sink,
+            logits_to_keep=logits_to_keep,
             **kwargs,
         )
         if logits_to_keep:
@@ -757,44 +914,10 @@ class LanguageModel(nn.Module):
         accepted: Any,
         block_size: int,
     ) -> int:
-        """Rewind target KV caches after a speculative-decoding round.
+        """Commit each request's accepted prefix through the shared transaction."""
+        from ...speculative.cache_state import rollback_speculative_cache
 
-        Gemma 4 has only KV/RotatingKV caches (no SSM/GDN), so this is a
-        simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
-        ignored) for API parity with qwen3_5's hook.
-        """
-        del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        if isinstance(accepted, (list, tuple)):
-            accepted = mx.array(accepted, dtype=mx.int32)
-
-        max_a = int(accepted.max().item())
-        n = max_a + 1
-        trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
-        for c in caches:
-            if c is None:
-                continue
-
-            if trim > 0 and hasattr(c, "trim"):
-                c.trim(trim)
-            if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
-                kv_len = c._idx
-                ve = valid_ends.tolist()
-                verify_start = kv_len - n
-                for bi in range(accepted.shape[0]):
-                    start = verify_start + int(ve[bi])
-                    if start < kv_len:
-                        zero_row_tail = getattr(c, "zero_row_tail", None)
-                        if callable(zero_row_tail):
-                            zero_row_tail(bi, start, kv_len)
-                        else:
-                            c.keys[bi, :, start:kv_len, :] = 0
-                            c.values[bi, :, start:kv_len, :] = 0
-        return max_a
+        return rollback_speculative_cache(caches, gdn_states, accepted, block_size)
 
     def sanitize(self, weights):
         sanitized = {}
