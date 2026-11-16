@@ -2950,6 +2950,78 @@ def test_parser_contract(name):
         assert result.remaining_text == text
 
 
+WRITE_TOOLS = [
+    dict(
+        type="function",
+        function=dict(
+            name="write",
+            parameters=dict(
+                type="object",
+                properties=dict(path=dict(type="string"), content=dict(type="string")),
+                required=["path", "content"],
+            ),
+        ),
+    )
+]
+
+# Muse quotes JSON documents as string-typed parameter values (measured on
+# the live wire, knowledge-builder ladder run 4, 2026-11-15): the parameter
+# text is valid JSON and must survive as the string the model sent.
+ATEM_WRITE_CALL = (
+    '<atem:invoke name="write">'
+    '<atem:parameter name="path">build/corpus/index.json</atem:parameter>'
+    '<atem:parameter name="content">[{"id": "C1", "url": "https://example.org"}]'
+    "</atem:parameter></atem:invoke>"
+)
+
+
+def test_atem_declared_string_parameters_are_never_json_coerced():
+    call = _parse("atem", ATEM_WRITE_CALL, WRITE_TOOLS)
+    assert call["name"] == "write"
+    assert call["arguments"]["path"] == "build/corpus/index.json"
+    assert (
+        call["arguments"]["content"]
+        == '[{"id": "C1", "url": "https://example.org"}]'
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026", "3", "true", "null", '[{"id": "C1"}]', '{"k": "v"}'],
+)
+def test_atem_json_looking_strings_stay_strings(value):
+    # The opposite direction of the same defect: a declared-string parameter
+    # whose text parses as JSON must not be retyped (query "2026", path "404").
+    body = (
+        '<atem:invoke name="get_weather">'
+        f'<atem:parameter name="city">{value}</atem:parameter>'
+        "</atem:invoke>"
+    )
+    call = _parse("atem", body, WEATHER_TOOLS)
+    assert call["arguments"]["city"] == value
+
+
+def test_atem_declared_scalars_still_coerce():
+    body = (
+        '<atem:invoke name="get_weather">'
+        '<atem:parameter name="city">Paris</atem:parameter>'
+        '<atem:parameter name="days">3</atem:parameter>'
+        "</atem:invoke>"
+    )
+    call = _parse("atem", body, WEATHER_TOOLS)
+    assert call["arguments"] == {"city": "Paris", "days": 3}
+
+
+def test_atem_without_schema_keeps_legacy_sniffing():
+    body = (
+        '<atem:invoke name="get_weather">'
+        '<atem:parameter name="days">3</atem:parameter>'
+        "</atem:invoke>"
+    )
+    call = _parse("atem", body, None)
+    assert call["arguments"] == {"days": 3}
+
+
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_selection(name):
     # Specific formats must outrank the generic JSON fallback.
